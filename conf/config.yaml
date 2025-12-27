@@ -1,0 +1,35 @@
+defaults:
+  - attacks: attacks
+  - datasets: datasets
+  - models: models
+  - paths
+  - override hydra/launcher: a100h100.yaml
+  - _self_
+
+hydra:
+  run:
+    dir: ${root_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
+  job:
+    chdir: true
+  sweep:
+    dir: ${root_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
+
+name: testing
+save_dir: ${root_dir}/outputs/  # place to store results
+embed_dir: ${root_dir}/embeddings/  # place to store embeddings for emebdding attacks
+overwrite: false
+
+classifiers: ["strong_reject"]  # anything from judgezoo
+
+# Top-level generation config for easier overriding
+generation_config:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 256
+  num_return_sequences: 1
+
+# overrides for parallelism
+attack: null
+dataset: adv_behaviors
+model: null
