@@ -10,13 +10,12 @@
 """
 
 from dataclasses import dataclass
-
-import jailbreakbench as jbb
+import os
+import pandas as pd
+# Removed import jailbreakbench to avoid litellm dependency issues
 
 from src.types import Conversation
-
 from .prompt_dataset import PromptDataset
-
 
 @dataclass
 class JBBBehaviorsConfig:
@@ -25,12 +24,31 @@ class JBBBehaviorsConfig:
     idx: list[int] | int | str | None = None
     shuffle: bool = True
 
-
 @PromptDataset.register("jbb_behaviors")
 class JBBBehaviorsDataset(PromptDataset):
     def __init__(self, config: JBBBehaviorsConfig):
         super().__init__(config)
-        dataset = jbb.read_dataset().as_dataframe()
+        
+        # Scheme B: Load directly from HuggingFace or local cache without jailbreakbench
+        cache_path = "data/behavior_datasets/jbb_behaviors.csv"
+        
+        if os.path.exists(cache_path):
+            dataset = pd.read_csv(cache_path)
+        else:
+            try:
+                from datasets import load_dataset
+                print(f"Downloading JBB-Behaviors from HuggingFace...")
+                hf_dataset = load_dataset("dedeswim/JBB-Behaviors", "behaviors", split="harmful")
+                dataset = hf_dataset.to_pandas()
+                # Optional: cache it locally for future offline use
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                dataset.to_csv(cache_path, index=False)
+            except Exception as e:
+                raise ImportError(
+                    f"Could not load JBB-Behaviors dataset. Network error or datasets not installed. "
+                    f"Original error: {e}. \n"
+                    f"Please ensure you have a stable network or provide {cache_path} manually."
+                ) from e
 
         self.idx, self.config_idx = self._select_idx(config, len(dataset))
 

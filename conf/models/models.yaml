@@ -332,3 +332,12 @@ Qwen/Qwen2.5-0.5B-Instruct:
   dtype: bfloat16
   chat_template: null
   trust_remote_code: True
+Qwen/Qwen3-8B:
+  id: /mnt/public/open_source_model/Qwen3-8B
+  tokenizer_id: /mnt/public/open_source_model/Qwen3-8B
+  short_name: Qwen3
+  developer_name: Qwen
+  compile: False
+  dtype: bfloat16
+  chat_template: null
+  trust_remote_code: True

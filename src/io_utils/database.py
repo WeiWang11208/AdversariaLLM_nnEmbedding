@@ -40,6 +40,9 @@ class SQLiteCollection:
         with self._get_conn() as conn:
             if filter and "log_file" in filter:
                 cursor = conn.execute("SELECT * FROM runs WHERE log_file = ?", (filter["log_file"],))
+            elif filter and "config" in filter:
+                config_str = json.dumps(filter["config"], sort_keys=True)
+                cursor = conn.execute("SELECT * FROM runs WHERE config = ?", (config_str,))
             else:
                 cursor = conn.execute("SELECT * FROM runs")
             
@@ -53,6 +56,10 @@ class SQLiteCollection:
                 }
                 results.append(doc)
             return results
+
+    def find_one(self, filter: dict = None, projection: dict = None) -> dict | None:
+        results = self.find(filter, projection)
+        return results[0] if results else None
 
     def replace_one(self, filter_dict: dict, replacement: dict, upsert: bool = False):
         # We assume the filter is by config, as in log_config_to_db

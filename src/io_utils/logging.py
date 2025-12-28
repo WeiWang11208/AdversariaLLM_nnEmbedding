@@ -7,12 +7,11 @@ and managing tensor offloading for large model embeddings.
 
 import copy
 import hashlib
-import json
 import logging
 import os
 from dataclasses import asdict
-
 import safetensors.torch
+import orjson
 from omegaconf import DictConfig, OmegaConf
 
 from ..attacks import AttackResult
@@ -67,7 +66,11 @@ def log_attack(run_config, result: AttackResult, cfg: DictConfig, date_time_stri
         log_file = os.path.join(log_dir, str(i), f"run.json")
 
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        with open(log_file, "w") as f:
-            json.dump(log_message, f, indent=2, cls=CompactJSONEncoder)
+        # Writing large run.json can be a bottleneck. Use fast binary JSON via orjson.
+        tmp_path = log_file + ".tmp"
+        data = orjson.dumps(log_message, option=orjson.OPT_INDENT_2)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, log_file)
         logging.info(f"Attack logged to {log_file}")
         log_config_to_db(subrun_config, subrun_result, log_file)
