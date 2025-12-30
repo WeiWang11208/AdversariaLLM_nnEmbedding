@@ -1,4 +1,5 @@
 import os
+import glob
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # determinism
 import copy
@@ -20,7 +21,7 @@ torch.use_deterministic_algorithms(True, warn_only=True)  # determinism
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
-def collect_run_paths(suffixes: list[str]|str, classifier: str, filter_by: dict|None) -> list[str]:
+def collect_run_paths(root_dir: str, suffixes: list[str]|str, classifier: str, filter_by: dict|None) -> list[str]:
     """
     Collect paths to run files that have not been scored by the specified classifier.
 
@@ -34,22 +35,35 @@ def collect_run_paths(suffixes: list[str]|str, classifier: str, filter_by: dict|
 
     if not isinstance(suffixes, (list, ListConfig)):
         suffixes = [str(suffixes)]
-    delete_orphaned_runs()
-    db = get_mongodb_connection()
-    collection = db.runs
+    # IMPORTANT: never delete output files as a side effect of judging.
+    # Only clean DB entries for missing files (safe), and do it in dry-run mode by default.
+    delete_orphaned_runs(dry_run=True, direction="db_only")
 
-    # Use MongoDB's find() method to get all documents
-    all_results = list(collection.find())
-    paths = []
-    for item in all_results:
-        log_file = item["log_file"]
-        date_time_string = log_file.split("/")[-3]
-        if classifier in item["scored_by"]:
-            continue
-        if any(date_time_string.endswith(suffix) for suffix in suffixes):
-            paths.append(log_file)
-    # remove duplicates
-    paths = list(set(paths))
+    # Prefer DB if it exists, but fall back to scanning outputs if DB is empty/missing.
+    paths: list[str] = []
+    try:
+        db = get_mongodb_connection()
+        collection = db.runs
+        all_results = list(collection.find())
+        for item in all_results:
+            log_file = item["log_file"]
+            date_time_string = log_file.split("/")[-3]
+            if classifier in item.get("scored_by", []):
+                continue
+            if any(date_time_string.endswith(suffix) for suffix in suffixes):
+                paths.append(log_file)
+        paths = list(set(paths))
+    except Exception:
+        paths = []
+
+    if not paths:
+        # DB likely not populated (e.g. different cwd/db path). Scan outputs directly.
+        pattern = os.path.join(root_dir, "outputs", "**", "run.json")
+        for p in glob.glob(pattern, recursive=True):
+            date_time_string = p.split("/")[-3]
+            if any(date_time_string.endswith(suffix) for suffix in suffixes):
+                paths.append(os.path.abspath(p))
+        paths = list(set(paths))
     if filter_by:
         filtered_paths = set(get_filtered_and_grouped_paths(OmegaConf.to_container(filter_by, resolve=True))[("all",)])
         paths = [p for p in paths if p in filtered_paths]
@@ -64,7 +78,7 @@ def run_judges(cfg: DictConfig) -> None:
     logging.info("-------------------")
     logging.info(cfg)
 
-    paths = collect_run_paths(cfg.suffixes, cfg.classifier, cfg.filter_by)
+    paths = collect_run_paths(cfg.root_dir, cfg.suffixes, cfg.classifier, cfg.filter_by)
     if not paths:
         logging.info("No unjudged paths found")
         return

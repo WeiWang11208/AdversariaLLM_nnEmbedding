@@ -177,6 +177,12 @@ gcg:
   placement: suffix
   generation_config: ${attacks._default.generation_config}
   seed: ${attacks._default.seed}
+  # Scheme A: stream per-step results to JSONL during execution to avoid slow final serialization.
+  stream_steps: True
+  stream_dir: null
+  # Show a tqdm progress bar during the stage-2 generation (generate_ragged_batched).
+  # This does NOT change results; it only prints progress.
+  generation_verbose: True
   num_steps: 250
   batch_size: 512
   optim_str_init: "x x x x x x x x x x x x x x x x x x x x" # all tested tokenizers convert this to exactly 20 tokens

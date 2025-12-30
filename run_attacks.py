@@ -105,6 +105,7 @@ def main(cfg: DictConfig) -> None:
         # Create judge config
         judge_cfg = OmegaConf.create({
             "classifier": judge,
+            "root_dir": cfg.root_dir,
             "suffixes": [date_time_string.split('/')[-1]],  # Use the timestamp from this run to make sure we only judge this run
             "filter_by": None
         })

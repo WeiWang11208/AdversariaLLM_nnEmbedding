@@ -18,7 +18,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Literal
 
 import torch
 import torch.nn.functional as F
@@ -234,9 +234,16 @@ class PGDAttack(Attack):
         if self.config.tie_logits > 0 or self.config.tie_features > 0:
              benign_ref_data = self._setup_benign_reference(model, tokenizer, B, device)
 
-        batch_losses = [[] for _ in range(B)]
-        batch_perturbed_embeddings_list = [[] for _ in range(B)]
-        batch_times = [[] for _ in range(B)]
+        batch_losses: list[list[float]] = [[] for _ in range(B)]
+        batch_times: list[list[float]] = [[] for _ in range(B)]
+        # For generation we only keep what we need, depending on config.
+        gen_mode: Literal["all", "best", "last"] = self.config.generation_config.generate_completions
+        if gen_mode == "all":
+            batch_prefix_embeds_per_step: list[list[torch.Tensor]] = [[] for _ in range(B)]  # each (T, D) on CPU
+        elif gen_mode == "best":
+            best_loss = torch.full((B,), float("inf"), device=device)
+            best_step: list[int] = [-1 for _ in range(B)]
+            best_prefix_embeds: list[torch.Tensor | None] = [None for _ in range(B)]  # (T, D) on CPU
 
         t_start = time.time()
         pbar = trange(self.config.num_steps, desc=f"Running PGD Attack Loop on {B} conversations", file=sys.stdout)
@@ -278,33 +285,55 @@ class PGDAttack(Attack):
                  original_model.zero_grad()
 
             current_time = time.time() - t0
-            step_losses = loss.detach().tolist()
+            step_losses: list[float] = loss.detach().float().tolist()
             for i in range(B):
                 batch_times[i].append(current_time)
                 batch_losses[i].append(step_losses[i])
-                # Storing only attack embeddings might be more memory efficient if needed later
-                # For now, storing relevant segment as per original logic
-                pert_emb_cpu = self._select_embeddings_for_generation(perturbed_embeddings_or_one_hot[i], target_masks_batch[i])
-                batch_perturbed_embeddings_list[i].append(pert_emb_cpu)
+                if gen_mode == "all":
+                    # Store the full *prefix* embeddings needed for generation (CPU)
+                    prefix_embeds = self._select_embeddings_for_generation(
+                        perturbed_embeddings[i], target_masks_batch[i]
+                    )
+                    batch_prefix_embeds_per_step[i].append(prefix_embeds)
+                elif gen_mode == "best":
+                    # Track best step per sample and store its generation prefix
+                    if step_losses[i] < best_loss[i].item():
+                        best_loss[i] = loss[i].detach()
+                        best_step[i] = step
+                        best_prefix_embeds[i] = self._select_embeddings_for_generation(
+                            perturbed_embeddings[i], target_masks_batch[i]
+                        )
 
-        # Generation after all steps
-        final_perturbed_embeddings_flat = []
-        # We need the embeddings corresponding to the *input* for generation, not just attack tokens
-        # Assuming the generation should start after the prompt+attack string
-        for i in range(B):
-             # Find the last index of the non-target part (pre+attack+prompt+post)
-             end_of_input_idx = torch.where(~target_masks_batch[i].roll(1,0))[0][-1].item()
-             for step in range(self.config.num_steps):
-                input_embeds_or_one_hot = batch_perturbed_embeddings_list[i][step][:end_of_input_idx + 1]
-                input_embeds = self._maybe_convert_to_embeddings(input_embeds_or_one_hot.to(model.device), model).cpu()
-                final_perturbed_embeddings_flat.append(input_embeds.cpu())
+        # ---- Generation -----------------------------------------------------
+        logging.info("PGD optimization done, generating completions...")
+        embedding_list: list[torch.Tensor] = []
+        # Also keep a mapping from generated item -> (sample_idx, step_idx)
+        gen_index: list[tuple[int, int]] = []
+        if gen_mode == "all":
+            for i in range(B):
+                for step in range(self.config.num_steps):
+                    embedding_list.append(batch_prefix_embeds_per_step[i][step])
+                    gen_index.append((i, step))
+        elif gen_mode == "last":
+            for i in range(B):
+                # Use final state
+                prefix_embeds = self._select_embeddings_for_generation(
+                    perturbed_embeddings[i], target_masks_batch[i]
+                )
+                embedding_list.append(prefix_embeds)
+                gen_index.append((i, self.config.num_steps - 1))
+        elif gen_mode == "best":
+            for i in range(B):
+                assert best_prefix_embeds[i] is not None, "best_prefix_embeds should have been set"
+                embedding_list.append(best_prefix_embeds[i])  # type: ignore[arg-type]
+                gen_index.append((i, best_step[i]))
+        else:
+            raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
 
-        # Generate based on the *final* perturbation state for each item in the batch
-        logging.info(f"Attacks done, generating completions...")
         outputs = generate_ragged_batched(
             model,
             tokenizer,
-            embedding_list=final_perturbed_embeddings_flat,
+            embedding_list=embedding_list,
             max_new_tokens=self.config.generation_config.max_new_tokens,
             temperature=self.config.generation_config.temperature,
             top_p=self.config.generation_config.top_p,
@@ -317,27 +346,55 @@ class PGDAttack(Attack):
         t_end = time.time()
         runs = []
         for i in range(B):
-             # Create step results, but only the last one has meaningful completions here
-             steps = []
-             for step in range(self.config.num_steps):
-                if self.config.log_embeddings:
-                     model_input_embeddings = batch_perturbed_embeddings_list[i][step].cpu()
-                else:
-                    model_input_embeddings = None
-                steps.append(AttackStepResult(
-                     step=step,
-                     model_completions=outputs[i * self.config.num_steps + step],
-                     time_taken=batch_times[i][step],
-                     loss=batch_losses[i][step],
-                     model_input_embeddings=model_input_embeddings,
-                     model_input=original_conversations_batch[i],
-                 ))
-             input_conversation = original_conversations_batch[i]
-             runs.append(SingleAttackRunResult(
-                 original_prompt=input_conversation,
-                 steps=steps,
-                 total_time=(t_end - t_start) / B
-             ))
+            steps: list[AttackStepResult] = []
+            if gen_mode == "all":
+                # outputs are ordered by (i, step) insertion above
+                # Find the segment in outputs for this sample:
+                base = i * self.config.num_steps
+                for step in range(self.config.num_steps):
+                    steps.append(
+                        AttackStepResult(
+                            step=step,
+                            model_completions=outputs[base + step],
+                            time_taken=batch_times[i][step],
+                            loss=batch_losses[i][step],
+                            model_input_embeddings=None,
+                            model_input=original_conversations_batch[i],
+                        )
+                    )
+            elif gen_mode == "last":
+                steps.append(
+                    AttackStepResult(
+                        step=self.config.num_steps - 1,
+                        model_completions=outputs[i],
+                        time_taken=batch_times[i][-1] if batch_times[i] else 0.0,
+                        loss=batch_losses[i][-1] if batch_losses[i] else None,
+                        model_input_embeddings=None,
+                        model_input=original_conversations_batch[i],
+                    )
+                )
+            elif gen_mode == "best":
+                steps.append(
+                    AttackStepResult(
+                        step=best_step[i],
+                        model_completions=outputs[i],
+                        time_taken=batch_times[i][best_step[i]] if batch_times[i] else 0.0,
+                        loss=batch_losses[i][best_step[i]] if batch_losses[i] else None,
+                        model_input_embeddings=None,
+                        model_input=original_conversations_batch[i],
+                    )
+                )
+            else:
+                raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
+
+            input_conversation = original_conversations_batch[i]
+            runs.append(
+                SingleAttackRunResult(
+                    original_prompt=input_conversation,
+                    steps=steps,
+                    total_time=(t_end - t_start) / B,
+                )
+            )
         return runs
 
     def _maybe_convert_to_embeddings(self, embeddings_or_one_hot, model):

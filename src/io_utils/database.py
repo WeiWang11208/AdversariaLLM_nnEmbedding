@@ -130,7 +130,7 @@ def log_config_to_db(run_config, result, log_file):
         )
 
 
-def delete_orphaned_runs(dry_run: bool = False, direction: str = "both"):
+def delete_orphaned_runs(dry_run: bool = True, direction: str = "db_only"):
     db = get_mongodb_connection()
 
     if direction in ["db_only", "both"]:

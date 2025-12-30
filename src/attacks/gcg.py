@@ -26,18 +26,21 @@ The implementation is inspired by nanoGCG, but fixes several issues in nanoGCG,
 mostly related to tokenization.
 """
 import gc
+import hashlib
 import logging
 import math
+import os
 import random
 import string
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Literal, Optional, cast
 
 import torch
 import transformers
+import orjson
 from torch import Tensor
 from tqdm import trange
 from transformers import DynamicCache, PreTrainedModel, PreTrainedTokenizerBase
@@ -276,6 +279,24 @@ class GCGAttack(Attack):
 
     def _attack_single_conversation(self, model, tokenizer, conversation) -> SingleAttackRunResult:
         t0 = time.time()
+        # --- Scheme A: optionally stream per-step results to disk as JSONL, then assemble later ---
+        # Enable via Hydra override (since cfg is struct):
+        #   attacks.gcg.stream_steps=true   (now also defaulted in conf/attacks/attacks.yaml)
+        # Optionally set directory (defaults to ${cwd}/.stream):
+        #   attacks.gcg.stream_dir=/path/to/dir
+        stream_steps = bool(getattr(self.config, "stream_steps", False))
+        stream_dir = getattr(self.config, "stream_dir", None)
+        steps_path = None
+        step_fh = None
+        if stream_steps:
+            if stream_dir is None:
+                stream_dir = os.path.join(os.getcwd(), ".stream")
+            os.makedirs(stream_dir, exist_ok=True)
+            # Unique per-run file name; avoids collisions across repeated runs.
+            run_hash = hashlib.sha256(f"{time.time_ns()} {os.getpid()}".encode()).hexdigest()
+            steps_path = os.path.join(stream_dir, f"gcg_steps_{run_hash}.jsonl")
+            # Create file early so users can observe progress directory immediately.
+            step_fh = open(steps_path, "wb")
         try:
             attack_conversation = [
                 {"role": "user", "content": conversation[0]["content"] + self.config.optim_str_init},
@@ -354,6 +375,21 @@ class GCGAttack(Attack):
                 flops.append(flops_for_step)
             pbar.set_postfix({"Loss": current_loss, "# TGT Toks": self.target_length, "Best Attack": optim_str[:80]})
 
+            # Stream progress immediately so the JSONL file is non-empty during the run.
+            # This record is for live monitoring only; the final per-step dicts (including completions)
+            # are appended later and used to assemble run.json.
+            if stream_steps and step_fh is not None:
+                step_fh.write(orjson.dumps({
+                    "record_type": "step_meta",
+                    "step": i,
+                    "loss": current_loss,
+                    "time_taken": time_for_step,
+                    "flops": flops[-1],
+                    "best_attack": optim_str,
+                }))
+                step_fh.write(b"\n")
+                step_fh.flush()
+
             if self.stop_flag:
                 self.logger.info("Early stopping due to finding a perfect match.")
                 break
@@ -373,13 +409,15 @@ class GCGAttack(Attack):
             tokenizer,
             token_list=token_list,
             initial_batch_size=len(token_list),
+            verbose=bool(getattr(self.config, "generation_verbose", False)),
             max_new_tokens=self.config.generation_config.max_new_tokens,
             temperature=self.config.generation_config.temperature,
             top_p=self.config.generation_config.top_p,
             top_k=self.config.generation_config.top_k,
             num_return_sequences=self.config.generation_config.num_return_sequences,
         )  # (N_steps, N_return_sequences, T)
-        steps = []
+
+        steps = [] if not stream_steps else None
         t1 = time.time()
         for i in range(len(optim_strings)):
             step = AttackStepResult(
@@ -391,13 +429,27 @@ class GCGAttack(Attack):
                 model_input=attack_conversations[i],
                 model_input_tokens=token_list[i].tolist(),
             )
-            steps.append(step)
+            if stream_steps:
+                assert step_fh is not None
+                # Append the full step dict (no record_type) so log assembly can write it verbatim.
+                step_fh.write(orjson.dumps(asdict(step)))
+                step_fh.write(b"\n")
+            else:
+                assert steps is not None
+                steps.append(step)
+
+        if step_fh is not None:
+            step_fh.flush()
+            step_fh.close()
 
         run = SingleAttackRunResult(
             original_prompt=conversation,
-            steps=steps,
+            steps=steps if steps is not None else [],
             total_time=t1 - t0,
         )
+        if steps_path is not None:
+            # Attach the streamed steps path for the logger to assemble a full run.json later
+            setattr(run, "_stream_steps_path", steps_path)
         return run
 
     def _single_step(self, model, tokenizer, conversation, token_selection, buffer, optim_ids):
