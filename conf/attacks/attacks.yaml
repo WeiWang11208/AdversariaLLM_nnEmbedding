@@ -183,7 +183,7 @@ gcg:
   # Show a tqdm progress bar during the stage-2 generation (generate_ragged_batched).
   # This does NOT change results; it only prints progress.
   generation_verbose: True
-  num_steps: 250
+  num_steps: 50
   batch_size: 512
   optim_str_init: "x x x x x x x x x x x x x x x x x x x x" # all tested tokenizers convert this to exactly 20 tokens
   search_width: 512

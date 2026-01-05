@@ -203,199 +203,223 @@ class PGDAttack(Attack):
         attack_masks_batch: torch.Tensor,
         target_masks_batch: torch.Tensor
     ) -> list[SingleAttackRunResult]:
+        # Freeze model weights to reduce VRAM usage: we only need gradients w.r.t.
+        # the optimized input representation (embeddings / relaxed one-hot).
+        model_params = list(model.parameters())
+        model_requires_grad = [p.requires_grad for p in model_params]
+        for p in model_params:
+            p.requires_grad_(False)
+
         t_start = time.time()
         device = model.device
         B, L = x_batch.shape
         disallowed_ids = get_disallowed_ids(tokenizer, allow_non_ascii=False, allow_special=False)
 
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
-        attention_mask_batch = attention_mask_batch.to(device)
-        attack_masks_batch = attack_masks_batch.to(device).bool()
-        target_masks_batch = target_masks_batch.to(device).bool()
+        try:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            attention_mask_batch = attention_mask_batch.to(device)
+            attack_masks_batch = attack_masks_batch.to(device).bool()
+            target_masks_batch = target_masks_batch.to(device).bool()
 
-        original_embeddings = model.get_input_embeddings()(x_batch)
-        if self.config.attack_space == "one-hot":
-            perturbed_embeddings_or_one_hot = (
-                F.one_hot(x_batch, num_classes=model.config.vocab_size)
-                .to(model.dtype)
-                .to(device)
-                .detach()
-            )
-        elif self.config.attack_space == "embedding":
-            perturbed_embeddings_or_one_hot = original_embeddings.detach().clone()
-        else:
-            raise ValueError(f"Unknown attack space {self.config.attack_space}")
+            original_embeddings = model.get_input_embeddings()(x_batch)
+            if self.config.attack_space == "one-hot":
+                perturbed_embeddings_or_one_hot = (
+                    F.one_hot(x_batch, num_classes=model.config.vocab_size)
+                    .to(model.dtype)
+                    .to(device)
+                    .detach()
+                )
+            elif self.config.attack_space == "embedding":
+                perturbed_embeddings_or_one_hot = original_embeddings.detach().clone()
+            else:
+                raise ValueError(f"Unknown attack space {self.config.attack_space}")
 
-        if self.zero_init_attack:
-            perturbed_embeddings_or_one_hot[attack_masks_batch] = 0
+            if self.zero_init_attack:
+                perturbed_embeddings_or_one_hot[attack_masks_batch] = 0
 
-        benign_ref_data = None
-        if self.config.tie_logits > 0 or self.config.tie_features > 0:
-             benign_ref_data = self._setup_benign_reference(model, tokenizer, B, device)
+            benign_ref_data = None
+            if self.config.tie_logits > 0 or self.config.tie_features > 0:
+                benign_ref_data = self._setup_benign_reference(model, tokenizer, B, device)
 
-        batch_losses: list[list[float]] = [[] for _ in range(B)]
-        batch_times: list[list[float]] = [[] for _ in range(B)]
-        # For generation we only keep what we need, depending on config.
-        gen_mode: Literal["all", "best", "last"] = self.config.generation_config.generate_completions
-        if gen_mode == "all":
-            batch_prefix_embeds_per_step: list[list[torch.Tensor]] = [[] for _ in range(B)]  # each (T, D) on CPU
-        elif gen_mode == "best":
-            best_loss = torch.full((B,), float("inf"), device=device)
-            best_step: list[int] = [-1 for _ in range(B)]
-            best_prefix_embeds: list[torch.Tensor | None] = [None for _ in range(B)]  # (T, D) on CPU
+            batch_losses: list[list[float]] = [[] for _ in range(B)]
+            batch_times: list[list[float]] = [[] for _ in range(B)]
+            # For generation we only keep what we need, depending on config.
+            gen_mode: Literal["all", "best", "last"] = self.config.generation_config.generate_completions
+            if gen_mode == "all":
+                batch_prefix_embeds_per_step: list[list[torch.Tensor]] = [[] for _ in range(B)]  # each (T, D) on CPU
+            elif gen_mode == "best":
+                best_loss = torch.full((B,), float("inf"), device=device)
+                best_step: list[int] = [-1 for _ in range(B)]
+                best_prefix_embeds: list[torch.Tensor | None] = [None for _ in range(B)]  # (T, D) on CPU
 
-        t_start = time.time()
-        pbar = trange(self.config.num_steps, desc=f"Running PGD Attack Loop on {B} conversations", file=sys.stdout)
-        perturbed_embeddings_or_one_hot.requires_grad = True
-        optimizer = self._initialize_optimizer([perturbed_embeddings_or_one_hot])
+            pbar = trange(self.config.num_steps, desc=f"Running PGD Attack Loop on {B} conversations", file=sys.stdout)
+            perturbed_embeddings_or_one_hot.requires_grad = True
+            optimizer = self._initialize_optimizer([perturbed_embeddings_or_one_hot])
 
-        for step in pbar:
-            t0 = time.time()
-            perturbed_embeddings = self._maybe_convert_to_embeddings(perturbed_embeddings_or_one_hot, model)
-            outputs = model(
-                inputs_embeds=perturbed_embeddings,
-                attention_mask=attention_mask_batch,
-                output_hidden_states=True
-            )
+            # Keep track of the latest embeddings for "last" generation mode.
+            perturbed_embeddings = None
 
-            loss = self._calculate_loss(outputs.logits, y_batch, target_masks_batch, tokenizer)
+            for step in pbar:
+                t0 = time.time()
+                optimizer.zero_grad(set_to_none=True)
 
-            kl_div_loss = 0.0
-            if original_model is not None and (self.config.tie_logits > 0 or self.config.tie_features > 0):
-                kl_div_loss = self._calculate_tying_loss(
-                    model, original_model, perturbed_embeddings, attention_mask_batch,
-                    attack_masks_batch, outputs, benign_ref_data, device
+                perturbed_embeddings = self._maybe_convert_to_embeddings(perturbed_embeddings_or_one_hot, model)
+                outputs = model(
+                    inputs_embeds=perturbed_embeddings,
+                    attention_mask=attention_mask_batch,
+                    output_hidden_states=True,
                 )
 
-            total_loss = loss + kl_div_loss
-            total_loss.mean().backward()
+                loss = self._calculate_loss(outputs.logits, y_batch, target_masks_batch, tokenizer)
 
-            grad = perturbed_embeddings_or_one_hot.grad
+                kl_div_loss = 0.0
+                if original_model is not None and (self.config.tie_logits > 0 or self.config.tie_features > 0):
+                    kl_div_loss = self._calculate_tying_loss(
+                        model, original_model, perturbed_embeddings, attention_mask_batch,
+                        attack_masks_batch, outputs, benign_ref_data, device
+                    )
 
-            with torch.no_grad():
-                grad = self._modify_gradient(grad, attack_masks_batch, disallowed_ids)
-                perturbed_embeddings_or_one_hot = self._perform_optimizer_step(
-                    optimizer, perturbed_embeddings_or_one_hot, original_embeddings, grad, attack_masks_batch, step
-                )
+                total_loss = loss + kl_div_loss
+                total_loss.mean().backward()
 
-            model.zero_grad()
-            pbar.set_postfix({"loss": loss.mean().item(), "kl_div": kl_div_loss.item() if isinstance(kl_div_loss, torch.Tensor) else kl_div_loss})
-            if original_model is not None:
-                 original_model.zero_grad()
+                with torch.no_grad():
+                    # IMPORTANT: modify gradients in-place on the actual .grad tensor
+                    # so the optimizer uses the masked/filtered gradient.
+                    if perturbed_embeddings_or_one_hot.grad is None:
+                        raise RuntimeError("Expected grad for optimized variable, got None")
+                    self._modify_gradient(perturbed_embeddings_or_one_hot.grad, attack_masks_batch, disallowed_ids)
+                    perturbed_embeddings_or_one_hot = self._perform_optimizer_step(
+                        optimizer,
+                        perturbed_embeddings_or_one_hot,
+                        original_embeddings,
+                        perturbed_embeddings_or_one_hot.grad,
+                        attack_masks_batch,
+                        step,
+                    )
 
-            current_time = time.time() - t0
-            step_losses: list[float] = loss.detach().float().tolist()
-            for i in range(B):
-                batch_times[i].append(current_time)
-                batch_losses[i].append(step_losses[i])
-                if gen_mode == "all":
-                    # Store the full *prefix* embeddings needed for generation (CPU)
+                model.zero_grad()
+                pbar.set_postfix({"loss": loss.mean().item(), "kl_div": kl_div_loss.item() if isinstance(kl_div_loss, torch.Tensor) else kl_div_loss})
+                if original_model is not None:
+                    original_model.zero_grad()
+
+                current_time = time.time() - t0
+                step_losses: list[float] = loss.detach().float().tolist()
+                for i in range(B):
+                    batch_times[i].append(current_time)
+                    batch_losses[i].append(step_losses[i])
+                    if gen_mode == "all":
+                        # Store the full *prefix* embeddings needed for generation (CPU)
+                        prefix_embeds = self._select_embeddings_for_generation(
+                            perturbed_embeddings[i], target_masks_batch[i]
+                        )
+                        batch_prefix_embeds_per_step[i].append(prefix_embeds)
+                    elif gen_mode == "best":
+                        # Track best step per sample and store its generation prefix
+                        if step_losses[i] < best_loss[i].item():
+                            best_loss[i] = loss[i].detach()
+                            best_step[i] = step
+                            best_prefix_embeds[i] = self._select_embeddings_for_generation(
+                                perturbed_embeddings[i], target_masks_batch[i]
+                            )
+
+            # ---- Generation -----------------------------------------------------
+            logging.info("PGD optimization done, generating completions...")
+            embedding_list: list[torch.Tensor] = []
+            # Also keep a mapping from generated item -> (sample_idx, step_idx)
+            gen_index: list[tuple[int, int]] = []
+            if gen_mode == "all":
+                for i in range(B):
+                    for step in range(self.config.num_steps):
+                        embedding_list.append(batch_prefix_embeds_per_step[i][step])
+                        gen_index.append((i, step))
+            elif gen_mode == "last":
+                assert perturbed_embeddings is not None, "perturbed_embeddings should be set after optimization"
+                for i in range(B):
+                    # Use final state
                     prefix_embeds = self._select_embeddings_for_generation(
                         perturbed_embeddings[i], target_masks_batch[i]
                     )
-                    batch_prefix_embeds_per_step[i].append(prefix_embeds)
-                elif gen_mode == "best":
-                    # Track best step per sample and store its generation prefix
-                    if step_losses[i] < best_loss[i].item():
-                        best_loss[i] = loss[i].detach()
-                        best_step[i] = step
-                        best_prefix_embeds[i] = self._select_embeddings_for_generation(
-                            perturbed_embeddings[i], target_masks_batch[i]
+                    embedding_list.append(prefix_embeds)
+                    gen_index.append((i, self.config.num_steps - 1))
+            elif gen_mode == "best":
+                for i in range(B):
+                    assert best_prefix_embeds[i] is not None, "best_prefix_embeds should have been set"
+                    embedding_list.append(best_prefix_embeds[i])  # type: ignore[arg-type]
+                    gen_index.append((i, best_step[i]))
+            else:
+                raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
+
+            outputs = generate_ragged_batched(
+                model,
+                tokenizer,
+                embedding_list=embedding_list,
+                max_new_tokens=self.config.generation_config.max_new_tokens,
+                temperature=self.config.generation_config.temperature,
+                top_p=self.config.generation_config.top_p,
+                top_k=self.config.generation_config.top_k,
+                num_return_sequences=self.config.generation_config.num_return_sequences,
+            )
+            logging.info(f"Generated {len(outputs)}x{self.config.generation_config.num_return_sequences} completions")
+
+            # Structure results
+            t_end = time.time()
+            runs = []
+            for i in range(B):
+                steps: list[AttackStepResult] = []
+                if gen_mode == "all":
+                    # outputs are ordered by (i, step) insertion above
+                    # Find the segment in outputs for this sample:
+                    base = i * self.config.num_steps
+                    for step in range(self.config.num_steps):
+                        steps.append(
+                            AttackStepResult(
+                                step=step,
+                                model_completions=outputs[base + step],
+                                time_taken=batch_times[i][step],
+                                loss=batch_losses[i][step],
+                                model_input_embeddings=None,
+                                model_input=original_conversations_batch[i],
+                            )
                         )
-
-        # ---- Generation -----------------------------------------------------
-        logging.info("PGD optimization done, generating completions...")
-        embedding_list: list[torch.Tensor] = []
-        # Also keep a mapping from generated item -> (sample_idx, step_idx)
-        gen_index: list[tuple[int, int]] = []
-        if gen_mode == "all":
-            for i in range(B):
-                for step in range(self.config.num_steps):
-                    embedding_list.append(batch_prefix_embeds_per_step[i][step])
-                    gen_index.append((i, step))
-        elif gen_mode == "last":
-            for i in range(B):
-                # Use final state
-                prefix_embeds = self._select_embeddings_for_generation(
-                    perturbed_embeddings[i], target_masks_batch[i]
-                )
-                embedding_list.append(prefix_embeds)
-                gen_index.append((i, self.config.num_steps - 1))
-        elif gen_mode == "best":
-            for i in range(B):
-                assert best_prefix_embeds[i] is not None, "best_prefix_embeds should have been set"
-                embedding_list.append(best_prefix_embeds[i])  # type: ignore[arg-type]
-                gen_index.append((i, best_step[i]))
-        else:
-            raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
-
-        outputs = generate_ragged_batched(
-            model,
-            tokenizer,
-            embedding_list=embedding_list,
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=self.config.generation_config.num_return_sequences,
-        )
-        logging.info(f"Generated {len(outputs)}x{self.config.generation_config.num_return_sequences} completions")
-
-        # Structure results
-        t_end = time.time()
-        runs = []
-        for i in range(B):
-            steps: list[AttackStepResult] = []
-            if gen_mode == "all":
-                # outputs are ordered by (i, step) insertion above
-                # Find the segment in outputs for this sample:
-                base = i * self.config.num_steps
-                for step in range(self.config.num_steps):
+                elif gen_mode == "last":
                     steps.append(
                         AttackStepResult(
-                            step=step,
-                            model_completions=outputs[base + step],
-                            time_taken=batch_times[i][step],
-                            loss=batch_losses[i][step],
+                            step=self.config.num_steps - 1,
+                            model_completions=outputs[i],
+                            time_taken=batch_times[i][-1] if batch_times[i] else 0.0,
+                            loss=batch_losses[i][-1] if batch_losses[i] else None,
                             model_input_embeddings=None,
                             model_input=original_conversations_batch[i],
                         )
                     )
-            elif gen_mode == "last":
-                steps.append(
-                    AttackStepResult(
-                        step=self.config.num_steps - 1,
-                        model_completions=outputs[i],
-                        time_taken=batch_times[i][-1] if batch_times[i] else 0.0,
-                        loss=batch_losses[i][-1] if batch_losses[i] else None,
-                        model_input_embeddings=None,
-                        model_input=original_conversations_batch[i],
+                elif gen_mode == "best":
+                    steps.append(
+                        AttackStepResult(
+                            step=best_step[i],
+                            model_completions=outputs[i],
+                            time_taken=batch_times[i][best_step[i]] if batch_times[i] else 0.0,
+                            loss=batch_losses[i][best_step[i]] if batch_losses[i] else None,
+                            model_input_embeddings=None,
+                            model_input=original_conversations_batch[i],
+                        )
                     )
-                )
-            elif gen_mode == "best":
-                steps.append(
-                    AttackStepResult(
-                        step=best_step[i],
-                        model_completions=outputs[i],
-                        time_taken=batch_times[i][best_step[i]] if batch_times[i] else 0.0,
-                        loss=batch_losses[i][best_step[i]] if batch_losses[i] else None,
-                        model_input_embeddings=None,
-                        model_input=original_conversations_batch[i],
-                    )
-                )
-            else:
-                raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
+                else:
+                    raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
 
-            input_conversation = original_conversations_batch[i]
-            runs.append(
-                SingleAttackRunResult(
-                    original_prompt=input_conversation,
-                    steps=steps,
-                    total_time=(t_end - t_start) / B,
+                input_conversation = original_conversations_batch[i]
+                runs.append(
+                    SingleAttackRunResult(
+                        original_prompt=input_conversation,
+                        steps=steps,
+                        total_time=(t_end - t_start) / B,
+                    )
                 )
-            )
-        return runs
+            return runs
+        finally:
+            # Restore original requires_grad flags to avoid affecting other code paths.
+            for p, req in zip(model_params, model_requires_grad):
+                p.requires_grad_(req)
 
     def _maybe_convert_to_embeddings(self, embeddings_or_one_hot, model):
         if self.config.attack_space == "one-hot":

@@ -42,5 +42,6 @@ class ORBenchDataset(PromptDataset):
         msg = self.messages[idx]
         conversation = [
             {"role": "user", "content": msg},
+            {"role": "assistant", "content": ""},  # Empty target for compatibility with direct attack
         ]
         return conversation

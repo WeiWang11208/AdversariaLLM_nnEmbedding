@@ -3,7 +3,7 @@ defaults:
   - datasets: datasets
   - models: models
   - paths
-  - override hydra/launcher: a100h100.yaml
+  - override hydra/launcher: basic
   - _self_
 
 hydra:
@@ -23,6 +23,7 @@ classifiers: ["strong_reject"]  # anything from judgezoo
 
 # Top-level generation config for easier overriding
 generation_config:
+  generate_completions: all  # "all", "best", or "last"
   temperature: 0.0
   top_p: 1.0
   top_k: 0
