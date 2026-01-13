@@ -244,6 +244,8 @@ class PGDAttack(Attack):
 
             batch_losses: list[list[float]] = [[] for _ in range(B)]
             batch_times: list[list[float]] = [[] for _ in range(B)]
+            # For logging embeddings (realizability analysis)
+            batch_full_embeds_per_step: list[list[torch.Tensor]] = [[] for _ in range(B)] if self.config.log_embeddings else []
             # For generation we only keep what we need, depending on config.
             gen_mode: Literal["all", "best", "last"] = self.config.generation_config.generate_completions
             if gen_mode == "all":
@@ -252,6 +254,7 @@ class PGDAttack(Attack):
                 best_loss = torch.full((B,), float("inf"), device=device)
                 best_step: list[int] = [-1 for _ in range(B)]
                 best_prefix_embeds: list[torch.Tensor | None] = [None for _ in range(B)]  # (T, D) on CPU
+                best_full_embeds: list[torch.Tensor | None] = [None for _ in range(B)] if self.config.log_embeddings else []
 
             pbar = trange(self.config.num_steps, desc=f"Running PGD Attack Loop on {B} conversations", file=sys.stdout)
             perturbed_embeddings_or_one_hot.requires_grad = True
@@ -308,6 +311,9 @@ class PGDAttack(Attack):
                 for i in range(B):
                     batch_times[i].append(current_time)
                     batch_losses[i].append(step_losses[i])
+                    # Log full embeddings for realizability analysis
+                    if self.config.log_embeddings:
+                        batch_full_embeds_per_step[i].append(perturbed_embeddings[i].detach().cpu())
                     if gen_mode == "all":
                         # Store the full *prefix* embeddings needed for generation (CPU)
                         prefix_embeds = self._select_embeddings_for_generation(
@@ -322,6 +328,9 @@ class PGDAttack(Attack):
                             best_prefix_embeds[i] = self._select_embeddings_for_generation(
                                 perturbed_embeddings[i], target_masks_batch[i]
                             )
+                            # Also save full embeddings for realizability analysis
+                            if self.config.log_embeddings:
+                                best_full_embeds[i] = perturbed_embeddings[i].detach().cpu()
 
             # ---- Generation -----------------------------------------------------
             logging.info("PGD optimization done, generating completions...")
@@ -347,7 +356,7 @@ class PGDAttack(Attack):
                     assert best_prefix_embeds[i] is not None, "best_prefix_embeds should have been set"
                     embedding_list.append(best_prefix_embeds[i])  # type: ignore[arg-type]
                     gen_index.append((i, best_step[i]))
-            else:
+            else: 
                 raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
 
             outputs = generate_ragged_batched(
@@ -372,35 +381,41 @@ class PGDAttack(Attack):
                     # Find the segment in outputs for this sample:
                     base = i * self.config.num_steps
                     for step in range(self.config.num_steps):
+                        # Get embeddings for this step if logging is enabled
+                        step_embeds = batch_full_embeds_per_step[i][step] if self.config.log_embeddings else None
                         steps.append(
                             AttackStepResult(
                                 step=step,
                                 model_completions=outputs[base + step],
                                 time_taken=batch_times[i][step],
                                 loss=batch_losses[i][step],
-                                model_input_embeddings=None,
+                                model_input_embeddings=step_embeds,
                                 model_input=original_conversations_batch[i],
                             )
                         )
                 elif gen_mode == "last":
+                    # Get last step embeddings if logging is enabled
+                    last_embeds = batch_full_embeds_per_step[i][-1] if self.config.log_embeddings else None
                     steps.append(
                         AttackStepResult(
                             step=self.config.num_steps - 1,
                             model_completions=outputs[i],
                             time_taken=batch_times[i][-1] if batch_times[i] else 0.0,
                             loss=batch_losses[i][-1] if batch_losses[i] else None,
-                            model_input_embeddings=None,
+                            model_input_embeddings=last_embeds,
                             model_input=original_conversations_batch[i],
                         )
                     )
                 elif gen_mode == "best":
+                    # Get best step embeddings if logging is enabled
+                    best_embeds = best_full_embeds[i] if self.config.log_embeddings else None
                     steps.append(
                         AttackStepResult(
                             step=best_step[i],
                             model_completions=outputs[i],
                             time_taken=batch_times[i][best_step[i]] if batch_times[i] else 0.0,
                             loss=batch_losses[i][best_step[i]] if batch_losses[i] else None,
-                            model_input_embeddings=None,
+                            model_input_embeddings=best_embeds,
                             model_input=original_conversations_batch[i],
                         )
                     )

@@ -159,6 +159,14 @@ class Attack(Generic[AttRes]):
                 from .random_search import RandomSearchAttack
 
                 return RandomSearchAttack
+            case "random_restart":
+                from .random_restart import RandomRestartAttack
+
+                return RandomRestartAttack
+            case "natural_suffix_embedding":
+                from .natural_suffix_embedding import NaturalSuffixEmbeddingAttack
+
+                return NaturalSuffixEmbeddingAttack
             case _:
                 raise ValueError(f"Unknown attack: {name}")
 

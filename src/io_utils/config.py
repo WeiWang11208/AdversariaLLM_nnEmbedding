@@ -19,6 +19,9 @@ class RunConfig:
     model_params: dict
     dataset_params: dict
     attack_params: dict
+    # Chunk the dataset into smaller pieces; each chunk is passed to attack.run(...)
+    # and results are concatenated before logging. 0 disables chunking.
+    batch_size: int = 0
 
 
 def filter_config(run_config: RunConfig, dset_len: int, overwrite: bool = False) -> RunConfig | None:

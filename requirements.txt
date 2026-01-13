@@ -1,4 +1,5 @@
 accelerate
+beartype
 flash-attn
 hydra-core>=1.3.0
 hydra-submitit-launcher

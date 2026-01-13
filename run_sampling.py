@@ -135,6 +135,7 @@ def main(cfg: DictConfig) -> None:
                 model_params=OmegaConf.structured(attack_run["config"]["model_params"]),
                 dataset_params=OmegaConf.structured(attack_run["config"]["dataset_params"]),
                 attack_params=OmegaConf.structured(attack_run["config"]["attack_params"]),
+                batch_size=attack_run["config"].get("batch_size", 0) or 0,
             )
 
             run_config = filter_config(run_config, -1)

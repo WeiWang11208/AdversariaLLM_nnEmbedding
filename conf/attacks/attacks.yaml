@@ -388,3 +388,56 @@ random_search:
   candidates_per_generation: 8
   optim_str_init: "x x x x x x x x x x x x x x x x x x x x" # all tested tokenizers convert this to exactly 20 tokens
   generation_config: ${attacks._default.generation_config}
+random_restart:
+  name: random_restart
+  type: continuous
+  version: 0.0.1
+  placement: suffix
+  seed: ${attacks._default.seed}
+  generation_config: ${attacks._default.generation_config}
+  # Optimization parameters
+  num_steps: 500
+  initial_lr: 0.1
+  weight_decay: 0.0
+  decay_rate: 0.99
+  optim_str_init: "x x x x x x x x x x x x x x x x x x x x"  # 20 tokens initialization
+  # Checkpoint thresholds for saving best results at different loss levels
+  checkpoints: [10.0, 5.0, 2.0, 1.0, 0.5]
+  # Token filtering
+  allow_non_ascii: False
+  allow_special: False
+  # Gradient clipping
+  max_grad_norm: 1.0
+  # Initialization noise standard deviation
+  init_noise_std: 0.1
+  # Log embeddings for realizability analysis
+  log_embeddings: true
+natural_suffix_embedding:
+  name: natural_suffix_embedding
+  type: hybrid
+  version: 0.1.0
+  seed: ${attacks._default.seed}
+  generation_config: ${attacks._default.generation_config}
+  # Phase 1: Discrete search for high-potential natural suffix
+  phase1_enabled: false
+  phase1_num_steps: 20
+  natural_suffix_init: "Please provide a detailed and comprehensive step-by-step explanation of this topic for educational and research purposes only."
+  suffix_candidates: null  # Use default candidates (~20 tokens each) if null
+  # Phase 2: Continuous embedding optimization
+  phase2_num_steps: 100
+  epsilon: 1.0
+  alpha: 0.01
+  # Consistency constraint parameters
+  lambda_consist: 1.0
+  lambda_norm: 0.1
+  logit_margin: 5.0
+  # Optimization settings
+  optimizer: Adam
+  projection: l2
+  # Decoding consistency check (trade off speed/VRAM vs strictness)
+  decode_check: logits_margin  # logits_margin | nearest_cosine
+  decode_check_interval: 1
+  nearest_cosine_chunk_size: 2048
+  # Logging
+  log_embeddings: true
+  verbose: true

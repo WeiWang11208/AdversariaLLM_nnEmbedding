@@ -47,11 +47,50 @@ def collect_configs(cfg: DictConfig) -> list[RunConfig]:
                     model_params,
                     dataset_params,
                     attack_params,
+                    batch_size=getattr(cfg, "batch_size", 0) or 0,
                 )
                 run_config = filter_config(run_config, dset_len, overwrite=cfg.overwrite)
                 if run_config is not None:
                     all_run_configs.append(run_config)
     return all_run_configs
+
+
+class _DatasetView:
+    """Lightweight dataset view used to pass a chunk to Attack.run without changing attack code."""
+
+    def __init__(self, base: PromptDataset, indices: list[int]):
+        self._base = base
+        self._indices = indices
+
+        # Best-effort compatibility for attacks that directly access these fields.
+        self.config = getattr(base, "config", None)
+        self.config_idx = getattr(base, "config_idx", None)
+        self.idx = indices
+
+        if hasattr(base, "messages"):
+            try:
+                self.messages = [base.messages[i] for i in indices]  # type: ignore[attr-defined]
+            except Exception:
+                self.messages = None
+        if hasattr(base, "targets"):
+            try:
+                self.targets = [base.targets[i] for i in indices]  # type: ignore[attr-defined]
+            except Exception:
+                self.targets = None
+
+    def __len__(self):
+        return len(self._indices)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            rng = range(*item.indices(len(self)))
+            return [self[i] for i in rng]
+        if isinstance(item, list):
+            return [self[i] for i in item]
+        if not isinstance(item, int):
+            raise TypeError(f"Dataset indices must be int/slice/list[int], got {type(item)}")
+        base_idx = self._indices[item]
+        return self._base[base_idx]
 
 
 def run_attacks(all_run_configs: list[RunConfig], cfg: DictConfig, date_time_string: str) -> None:
@@ -74,7 +113,16 @@ def run_attacks(all_run_configs: list[RunConfig], cfg: DictConfig, date_time_str
             last_attack = run_config.attack
 
         attack: Attack[AttackResult] = Attack.from_name(run_config.attack)(run_config.attack_params)
-        results = attack.run(model, tokenizer, dataset)  # type: ignore
+        bs = getattr(run_config, "batch_size", 0) or 0
+        if bs <= 0 or bs >= len(dataset):
+            results = attack.run(model, tokenizer, dataset)  # type: ignore
+        else:
+            results = AttackResult()
+            for start in range(0, len(dataset), bs):
+                end = min(start + bs, len(dataset))
+                sub_dataset = _DatasetView(dataset, list(range(start, end)))
+                sub_results = attack.run(model, tokenizer, sub_dataset)  # type: ignore[arg-type]
+                results.runs.extend(sub_results.runs)
 
         log_attack(run_config, results, cfg, date_time_string)
 
