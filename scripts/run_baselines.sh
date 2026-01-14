@@ -28,7 +28,6 @@ run_attack() {
     "model=${MODEL}" \
     "batch_size=1" \
     "dataset=${DATASET}" \
-    "datasets.${DATASET}.idx=${IDX_EXPR}" \
     "attack=${attack_name}" \
     "save_dir=${out_dir}"
 }

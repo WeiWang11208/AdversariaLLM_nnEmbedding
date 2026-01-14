@@ -267,3 +267,77 @@
 4. 机制分析：同 token 不同行为、logits/margin 轨迹、检测实验  
 5. 消融：phase1、margin/epsilon/steps、检查方式、扰动位置  
 6. 局限与伦理：白盒假设、潜在防御方向（margin 强化/鲁棒训练）  
+
+---
+
+## 10. 各实验应绘制的指标与曲线（论文落地 Checklist）
+
+本节把上文所有实验“需要画什么图、报什么指标”固定成统一模板，避免出现对比不公平或指标缺失。
+
+### 10.1 统一指标口径（建议默认都报告）
+对每个 (Model, Dataset, Method)：
+- **ASR_oracle**：对每个样本取 `max_{step,completion} p_harmful > τ` 的成功率（τ 默认 0.5）
+- **ASR_last**：仅用最后一步（或最终输出）计算 ASR（衡量稳定性/可部署）
+- **p_harmful 分布**：至少报告 mean；建议加 p50/p90（概率型 judge 不应只二值化）
+- **suffix_tokens**：后缀 token 长度（公平性必需）
+- **suffix_ppl（visible suffix PPL）**：后缀可见文本的困惑度
+- **文本不变性 / 解码一致性**：
+  - 对本文方法：`decode_ok rate`（logits margin check）或 `NN token match rate`
+  - 对 embedding 攻击：可额外给 `NN-decoded` 的 token match / decode_ppl
+- **成本**：time/sample 与峰值 VRAM（至少主表给 time/sample）
+
+### 10.2 主结果（Sec.4）应画什么
+**主表（至少一张）**：
+| Method | ASR_oracle↑ | ASR_last↑ | mean p_harmful↑ | suffix_ppl↓ | suffix_tokens | invariance↑ | time/sample↓ |
+
+**主图（强烈建议两张）**：
+1) **Stealth–Effectiveness Pareto**  
+   - x：suffix_ppl（或 detector score）  
+   - y：ASR_oracle（或 mean p_harmful）  
+   - 点：Prompt-only / Ours / GCG / PGD / BEAST / …  
+2) **按类别 ASR 分解**（HarmBench semantic category）  
+   - x：类别；y：ASR_oracle；多方法对比
+
+### 10.3 公平性对齐（Sec.3.5）应画什么
+**Length-matched（固定后缀长度 L）**：
+- 曲线A：ASR_oracle vs L（每方法一条线）
+- 曲线B：suffix_ppl vs L（每方法一条线）
+
+**Compute-matched（对齐计算预算）**：
+- 曲线：ASR_oracle vs compute（wall-time / #forward/#backward / steps）
+- 辅助表：time/sample、VRAM peak
+
+**Seed/Init-matched（多 seed）**：
+- 箱线图或误差棒：ASR across seeds（同时给 Single-run 与 Best-of-N）
+
+### 10.4 消融（Sec.5）应画什么
+**Phase1 作用（5.1）**：
+- 曲线：ASR_by_step（或 mean p_harmful by step）对比 Phase1-only / Full / Prompt-only
+- 直方图：best_step_hist（oracle 最强 step 出现在哪）
+
+**一致性约束（5.2）**：
+- Pareto：x=invariance（decode_ok 或 token match），y=ASR_oracle
+- 或热力图：`logit_margin × epsilon → ASR`，以及对应的 `→ decode_ok`
+
+**epsilon 与 steps（5.3）**：
+- 曲线：ASR_oracle vs epsilon；decode_ok vs epsilon
+- 收敛曲线：mean p_harmful by step（不同 epsilon 叠加）
+
+**一致性检查方式（5.5）**：
+- 条形图：time/sample、VRAM peak（logits-margin vs NN decode）
+- 散点：ASR vs decode_ok（两种检查方式两组点云）
+
+### 10.5 机制与案例（Sec.6）应画什么
+**同一句话，不同行为（6.1）**：
+- 表/附录：相同 suffix 文本（exact match）下 Prompt-only vs Ours 的输出 + p_harmful 分数
+
+**轨迹图（6.2，强烈建议）**：
+- `p_harmful` by step：均值 + 分位带（p10–p90）
+- ASR_by_step：每步成功率曲线（阈值化）
+
+### 10.6 失败模式（Sec.7）建议补什么图
+- 条形图：失败原因占比
+  - decode 约束失败（decode_ok 低）
+  - oracle 成功但 last 失败（不稳定）
+  - PPL/检测器未通过（自然性失败）
+  - 按类别失败（category breakdown）
