@@ -511,6 +511,59 @@ class SuffixMetricsComputer:
             "edit_distance": edit_distance,
         }
 
+    def _attach_decode_metrics(
+        self,
+        metrics: dict,
+        decoded_text: str,
+        decoded_ids: list[int],
+        suffix_text: str,
+        attack_params: dict,
+        model_id: str,
+        *,
+        orig_suffix_ids: list[int] | None = None,
+    ) -> None:
+        decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
+        decoded_ppl = self.compute_ppl(decoded_text, model_id)
+        metrics["decode_text"] = [decoded_text]
+        metrics["decode_text_raw"] = [decoded_text_raw]
+        metrics["decode_token_ids"] = [decoded_ids]
+        metrics["decode_ppl"] = [decoded_ppl]
+
+        if orig_suffix_ids is None:
+            orig_suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
+
+        init_text = attack_params.get("optim_str_init")
+        if isinstance(init_text, str) and init_text:
+            init_ids = self.tokenizer.encode(init_text, add_special_tokens=False)
+            init_metrics = self.compute_decode_match(
+                init_text, decoded_text, init_ids, decoded_ids
+            )
+            metrics["decode_exact_text_match"] = [1.0 if init_metrics["exact_text_match"] else 0.0]
+            metrics["decode_exact_token_match"] = [1.0 if init_metrics["exact_token_match"] else 0.0]
+            metrics["decode_token_match_rate"] = [init_metrics["token_match_rate"]]
+            metrics["decode_edit_distance"] = [init_metrics["edit_distance"]]
+            # Retain explicit init comparison for downstream tooling.
+            metrics["decode_init_exact_text_match"] = [1.0 if init_metrics["exact_text_match"] else 0.0]
+            metrics["decode_init_exact_token_match"] = [1.0 if init_metrics["exact_token_match"] else 0.0]
+            metrics["decode_init_token_match_rate"] = [init_metrics["token_match_rate"]]
+            metrics["decode_init_edit_distance"] = [init_metrics["edit_distance"]]
+
+            suffix_metrics = self.compute_decode_match(
+                suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+            )
+            metrics["decode_suffix_exact_text_match"] = [1.0 if suffix_metrics["exact_text_match"] else 0.0]
+            metrics["decode_suffix_exact_token_match"] = [1.0 if suffix_metrics["exact_token_match"] else 0.0]
+            metrics["decode_suffix_token_match_rate"] = [suffix_metrics["token_match_rate"]]
+            metrics["decode_suffix_edit_distance"] = [suffix_metrics["edit_distance"]]
+        else:
+            match_metrics = self.compute_decode_match(
+                suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+            )
+            metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
+            metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
+            metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
+            metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
+
     @staticmethod
     def _levenshtein_distance(s1: str, s2: str) -> int:
         """Compute Levenshtein edit distance between two strings."""
@@ -636,20 +689,14 @@ class SuffixMetricsComputer:
                         decoded_ids = [int(t) for t in saved_token_ids[0]]
                 if decoded_ids is not None:
                     decoded_text = self.tokenizer.decode(decoded_ids, skip_special_tokens=True)
-                    decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
-                    orig_suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
-                    match_metrics = self.compute_decode_match(
-                        suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                    self._attach_decode_metrics(
+                        metrics,
+                        decoded_text,
+                        decoded_ids,
+                        suffix_text,
+                        attack_params,
+                        effective_model_id,
                     )
-                    decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
-                    metrics["decode_text"] = [decoded_text]
-                    metrics["decode_text_raw"] = [decoded_text_raw]
-                    metrics["decode_token_ids"] = [decoded_ids]
-                    metrics["decode_ppl"] = [decoded_ppl]
-                    metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
-                    metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
-                    metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
-                    metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
                     embeddings_path = None
 
                 # If embeddings available, do NN decode
@@ -676,20 +723,14 @@ class SuffixMetricsComputer:
                             # Heuristic: treat as suffix-only if it matches suffix token count.
                             if emb_len > 0 and emb_len <= max(1, suffix_tokens + 2):
                                 decoded_text, decoded_ids = self.nn_decode_embeddings(embeddings, 0, emb_len)
-                                decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
-                                orig_suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
-                                match_metrics = self.compute_decode_match(
-                                    suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                                self._attach_decode_metrics(
+                                    metrics,
+                                    decoded_text,
+                                    decoded_ids,
+                                    suffix_text,
+                                    attack_params,
+                                    effective_model_id,
                                 )
-                                decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
-                                metrics["decode_text"] = [decoded_text]
-                                metrics["decode_text_raw"] = [decoded_text_raw]
-                                metrics["decode_token_ids"] = [decoded_ids]
-                                metrics["decode_ppl"] = [decoded_ppl]
-                                metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
-                                metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
-                                metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
-                                metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
                                 embeddings = None
 
                         if embeddings is not None:
@@ -827,19 +868,15 @@ class SuffixMetricsComputer:
                                             decoded_text, decoded_ids = self.nn_decode_embeddings(
                                                 perturbed, suffix_start_in_attack, suffix_len_in_attack
                                             )
-                                            decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
-                                            match_metrics = self.compute_decode_match(
-                                                suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                                            self._attach_decode_metrics(
+                                                metrics,
+                                                decoded_text,
+                                                decoded_ids,
+                                                suffix_text,
+                                                attack_params,
+                                                effective_model_id,
+                                                orig_suffix_ids=orig_suffix_ids,
                                             )
-                                            decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
-                                            metrics["decode_text"] = [decoded_text]
-                                            metrics["decode_text_raw"] = [decoded_text_raw]
-                                            metrics["decode_token_ids"] = [decoded_ids]
-                                            metrics["decode_ppl"] = [decoded_ppl]
-                                            metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
-                                            metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
-                                            metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
-                                            metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
                                             embeddings = None  # Done
 
                             # Non-delta path: decode from the full-sequence embeddings.
@@ -851,19 +888,15 @@ class SuffixMetricsComputer:
 
                             if embeddings is not None:
                                 decoded_text, decoded_ids = self.nn_decode_embeddings(embeddings, suffix_start, suffix_len)
-                                decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
-                                match_metrics = self.compute_decode_match(
-                                    suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                                self._attach_decode_metrics(
+                                    metrics,
+                                    decoded_text,
+                                    decoded_ids,
+                                    suffix_text,
+                                    attack_params,
+                                    effective_model_id,
+                                    orig_suffix_ids=orig_suffix_ids,
                                 )
-                                decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
-                                metrics["decode_text"] = [decoded_text]
-                                metrics["decode_text_raw"] = [decoded_text_raw]
-                                metrics["decode_token_ids"] = [decoded_ids]
-                                metrics["decode_ppl"] = [decoded_ppl]
-                                metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
-                                metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
-                                metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
-                                metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
 
                     except Exception as e:
                         logger.warning(f"Failed to process embeddings for {run_path}: {e}")
