@@ -327,6 +327,39 @@ class NaturalSuffixEmbeddingAttack(Attack):
             embedding_layer = model.get_input_embeddings()
             original_embeddings = embedding_layer(tokens).detach()
             original_attack_embeddings = original_embeddings[0, attack_mask].detach()
+            attack_prefix_len = attack_prefix_toks.size(0)
+            attack_suffix_len = attack_suffix_toks.size(0)
+
+            decode_vocab_norm = None
+            attack_base_cpu = None
+            if self.config.log_embeddings:
+                vocab = embedding_layer.weight.detach()
+                if hasattr(embedding_layer, "embed_scale"):
+                    vocab = vocab * embedding_layer.embed_scale.to(vocab)
+                vocab = vocab.float().cpu()
+                decode_vocab_norm = vocab / (vocab.norm(dim=-1, keepdim=True) + 1e-8)
+                attack_base_cpu = original_attack_embeddings.detach().cpu().float()
+
+            def _nn_decode_suffix(delta_cpu: torch.Tensor) -> list[int]:
+                if decode_vocab_norm is None or attack_base_cpu is None:
+                    return []
+                attack_embeds = attack_base_cpu + delta_cpu.float()
+                if attack_embeds.numel() == 0:
+                    return []
+                attack_norm = attack_embeds / (attack_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+                chunk_size = max(1, int(self.config.nearest_cosine_chunk_size))
+                best_sim = torch.full((attack_norm.size(0),), -float("inf"), dtype=torch.float32)
+                best_id = torch.zeros((attack_norm.size(0),), dtype=torch.long)
+                for start in range(0, decode_vocab_norm.size(0), chunk_size):
+                    end = min(start + chunk_size, decode_vocab_norm.size(0))
+                    chunk = decode_vocab_norm[start:end]
+                    sims = attack_norm @ chunk.t()
+                    chunk_best_sim, chunk_best_idx = sims.max(dim=-1)
+                    improved = chunk_best_sim > best_sim
+                    best_sim[improved] = chunk_best_sim[improved]
+                    best_id[improved] = chunk_best_idx[improved] + start
+                full_ids = best_id.tolist()
+                return full_ids[attack_prefix_len:attack_prefix_len + attack_suffix_len]
             delta_attack = torch.zeros_like(original_attack_embeddings, requires_grad=True)
 
             # Optimizer
@@ -478,11 +511,22 @@ class NaturalSuffixEmbeddingAttack(Attack):
             if gen_mode == "all":
                 for i in range(len(completions)):
                     step_delta = deltas_per_step[i] if self.config.log_embeddings else None
+                    decode_scores = {}
+                    if step_delta is not None:
+                        decoded_ids = _nn_decode_suffix(step_delta)
+                        decode_scores = {
+                            "token_ids": [float(t) for t in decoded_ids],
+                        }
                     steps.append(
                         AttackStepResult(
                             step=i,
                             model_completions=completions[i],
-                            scores={"decode": {"decode_ok": [1.0 if per_step_decode_ok[i] else 0.0]}},
+                            scores={
+                                "decode": {
+                                    "decode_ok": [1.0 if per_step_decode_ok[i] else 0.0],
+                                    **(decode_scores if decode_scores else {}),
+                                }
+                            },
                             time_taken=per_step_times[i] + (t_gen / max(1, len(completions))),
                             loss=per_step_losses[i],
                             model_input=attack_conversation_gen,
@@ -494,11 +538,22 @@ class NaturalSuffixEmbeddingAttack(Attack):
                 if completions:
                     step_loss = per_step_losses[best_step] if 0 <= best_step < len(per_step_losses) else last_total_loss
                     step_decode_ok = per_step_decode_ok[best_step] if 0 <= best_step < len(per_step_decode_ok) else True
+                    decode_scores = {}
+                    if best_delta_cpu is not None:
+                        decoded_ids = _nn_decode_suffix(best_delta_cpu)
+                        decode_scores = {
+                            "token_ids": [float(t) for t in decoded_ids],
+                        }
                     steps.append(
                         AttackStepResult(
                             step=best_step if best_step >= 0 else self.config.phase2_num_steps - 1,
                             model_completions=completions[0],
-                            scores={"decode": {"decode_ok": [1.0 if step_decode_ok else 0.0]}},
+                            scores={
+                                "decode": {
+                                    "decode_ok": [1.0 if step_decode_ok else 0.0],
+                                    **(decode_scores if decode_scores else {}),
+                                }
+                            },
                             time_taken=(time.time() - phase2_t0) + t_gen,
                             loss=best_total_loss if best_total_loss < float("inf") else step_loss,
                             model_input=attack_conversation_gen,

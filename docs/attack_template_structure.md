@@ -53,21 +53,7 @@ AdversariaLLM/
 run_attacks.py (main)
     ↓
 collect_configs()  # 收集所有配置组合
-    ├── 选择models (从config.yaml或命令行)
-    ├── 选择datasets (从config.yaml或命令行)
-    └── 选择attacks (从config.yaml或命令行)
-    ↓
-run_attacks()  # 执行所有攻击
-    ↓
-对每个(model, dataset, attack)组合:
-    ├── 加载model和tokenizer (如果变化)
-    ├── 加载dataset (如果变化)
-    ├── 创建Attack实例: Attack.from_name(attack_name)(attack_params)
-    ├── 执行attack: attack.run(model, tokenizer, dataset)
-    └── 记录结果: log_attack(run_config, results, cfg, date_time_string)
-    ↓
-run_judges()  # 可选：运行评判器
-```
+ 
 
 ### 2.2 run_attacks.py 关键函数
 

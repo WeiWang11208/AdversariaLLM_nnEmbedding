@@ -36,8 +36,10 @@ class StrongRejectDataset(PromptDataset):
     def __init__(self, config: StrongRejectConfig):
         super().__init__(config)
         full_url = "https://raw.githubusercontent.com/alexandrasouly/strongreject/main/strongreject_dataset/strongreject_dataset.csv"
+        local_full = os.path.join(config.path, "strongreject_dataset.csv")
+        full_source = local_full if os.path.exists(local_full) else full_url
 
-        self.dataset = load_dataset("csv", data_files=full_url)[config.split]
+        self.dataset = load_dataset("csv", data_files=full_source)[config.split]
         self.targets = [line.rstrip() for line in open(os.path.join(config.path, "targets.txt"), "r").readlines()]
         assert len(self.dataset) == len(self.targets), f"Mismatched lengths, {len(self.dataset)} != {len(self.targets)}"
 
@@ -46,7 +48,9 @@ class StrongRejectDataset(PromptDataset):
 
         if config.version == "small":
             small_url = "https://raw.githubusercontent.com/alexandrasouly/strongreject/main/strongreject_dataset/strongreject_small_dataset.csv"
-            self.small_dataset = load_dataset("csv", data_files=small_url)[config.split]
+            local_small = os.path.join(config.path, "strongreject_small_dataset.csv")
+            small_source = local_small if os.path.exists(local_small) else small_url
+            self.small_dataset = load_dataset("csv", data_files=small_source)[config.split]
             small_dataset_df = self.small_dataset.to_pandas()
             small_prompts = set(small_dataset_df["forbidden_prompt"])
             self.dataset = self.dataset[self.dataset["forbidden_prompt"].isin(small_prompts)]

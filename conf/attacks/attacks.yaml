@@ -396,7 +396,7 @@ random_restart:
   seed: ${attacks._default.seed}
   generation_config: ${attacks._default.generation_config}
   # Optimization parameters
-  num_steps: 500
+  num_steps: 100
   initial_lr: 0.1
   weight_decay: 0.0
   decay_rate: 0.99

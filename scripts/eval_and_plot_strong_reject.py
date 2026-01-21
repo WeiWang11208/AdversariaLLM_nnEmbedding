@@ -10,7 +10,7 @@ This script assumes `run.json` already contains `scores.strong_reject.p_harmful`
 
 Example:
   python scripts/eval_and_plot_strong_reject.py \\
-    --results_dir outputs/natural_suffix_embedding/2026-01-11/18-03-58 \\
+    --results_dir /mnt/public/share/users/wangwei/202512/AdversariaLLM-main/outputs/gcg/2026-01-17/03-13-51 \\
     --recursive \\
     --tag 2026-01-11_18-03-58
 """

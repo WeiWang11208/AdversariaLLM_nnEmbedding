@@ -9,6 +9,10 @@ This script computes:
 4. decode_text: Text decoded from embeddings via nearest neighbor (if embeddings available)
 5. decode_match: Whether decoded text matches original suffix (for embedding attacks)
 
+Notes:
+- For `natural_suffix_embedding`, `model_input_embeddings` logs per-token deltas (N_attack, D). This script reconstructs
+  the perturbed embeddings by adding the deltas to the base token embeddings before NN decoding.
+
 Usage:
     # Auto-detect model from run.json config
     python scripts/compute_suffix_metrics.py --results_dir outputs/ --recursive
@@ -21,6 +25,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import json
 import logging
@@ -35,6 +40,11 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Ensure repo root is on sys.path so `import src.*` works even when run from elsewhere.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 class SuffixMetricsComputer:
@@ -107,19 +117,9 @@ class SuffixMetricsComputer:
         if not model_input or not original_prompt:
             return ""
 
-        # Find the user message in both
-        orig_user_content = ""
-        attack_user_content = ""
-
-        for msg in original_prompt:
-            if msg.get("role") == "user":
-                orig_user_content = msg.get("content", "")
-                break
-
-        for msg in model_input:
-            if msg.get("role") == "user":
-                attack_user_content = msg.get("content", "")
-                break
+        # Find the last user message in both (most attacks modify the final user turn).
+        orig_user_content = next((m.get("content", "") for m in reversed(original_prompt) if m.get("role") == "user"), "")
+        attack_user_content = next((m.get("content", "") for m in reversed(model_input) if m.get("role") == "user"), "")
 
         # Extract suffix as the difference
         if attack_user_content.startswith(orig_user_content):
@@ -135,6 +135,153 @@ class SuffixMetricsComputer:
                 break
 
         return attack_user_content[common_len:]
+
+    def _attack_conversation_with_target(
+        self,
+        *,
+        clean_conversation: list[dict],
+        attack_conversation: list[dict],
+    ) -> list[dict]:
+        """
+        Build an "attack conversation" that keeps the clean assistant target.
+
+        Many attacks log `model_input` with the assistant content blank (generation prompt), but tokenization
+        and logged embeddings may have been computed with the original target present. Keeping the clean
+        target makes `prepare_conversation()` stable.
+        """
+        if not clean_conversation:
+            return copy.deepcopy(attack_conversation)
+        out = copy.deepcopy(attack_conversation)
+        # If both have an assistant as the final message, copy the clean target content.
+        if (
+            out
+            and clean_conversation
+            and out[-1].get("role") == "assistant"
+            and clean_conversation[-1].get("role") == "assistant"
+        ):
+            out[-1]["content"] = clean_conversation[-1].get("content", "")
+        return out
+
+    def _suffix_span_via_prepare_conversation(
+        self,
+        *,
+        clean_conversation: list[dict],
+        attack_conversation: list[dict],
+    ) -> tuple[int, int, list[int], int] | None:
+        """
+        Return (suffix_start_in_full, suffix_len, suffix_token_ids, attack_prefix_len) if possible.
+
+        Uses the repo's `prepare_conversation()` splitter, which matches the attacks' tokenization behavior
+        (chat templates, tokenizer quirks, etc.) far better than re-tokenizing only the user string.
+        """
+        try:
+            from src.lm_utils.tokenization import TokenMergeError, prepare_conversation
+        except Exception:
+            return None
+
+        if not clean_conversation or not attack_conversation:
+            return None
+        if clean_conversation[-1].get("role") != "assistant":
+            return None
+
+        # Ensure we include the clean target content for stable segmentation.
+        attack_with_target = self._attack_conversation_with_target(
+            clean_conversation=clean_conversation,
+            attack_conversation=attack_conversation,
+        )
+
+        try:
+            parts_per_turn = prepare_conversation(self.tokenizer, clean_conversation, attack_with_target)
+        except TokenMergeError:
+            return None
+        if not parts_per_turn:
+            return None
+
+        # We assume the suffix attack is on the last user turn.
+        # Important: for multi-turn conversations, the last tuple's `pre_toks` is only the separator
+        # before that user message, so we need to add the total length of previous turns.
+        prefix_total = 0
+        if len(parts_per_turn) > 1:
+            for turn_parts in parts_per_turn[:-1]:
+                prefix_total += int(torch.cat(turn_parts).size(0))
+
+        pre_toks, attack_prefix_toks, prompt_toks, attack_suffix_toks, _, _ = parts_per_turn[-1]
+        suffix_start_turn = int(pre_toks.size(0) + attack_prefix_toks.size(0) + prompt_toks.size(0))
+        suffix_start = prefix_total + suffix_start_turn
+        suffix_len = int(attack_suffix_toks.size(0))
+        suffix_ids = attack_suffix_toks.tolist()
+        attack_prefix_len = int(attack_prefix_toks.size(0))
+        return suffix_start, suffix_len, suffix_ids, attack_prefix_len
+
+    @staticmethod
+    def _lcp_len(a: list[int], b: list[int]) -> int:
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    @staticmethod
+    def _lcsuf_len(a: list[int], b: list[int], *, max_len: int | None = None) -> int:
+        n = min(len(a), len(b))
+        if max_len is not None:
+            n = min(n, max_len)
+        i = 0
+        while i < n and a[-1 - i] == b[-1 - i]:
+            i += 1
+        return i
+
+    def _suffix_span_via_token_diff(
+        self,
+        *,
+        clean_conversation: list[dict],
+        attack_conversation: list[dict],
+        suffix_tokens: int,
+    ) -> tuple[int, int, list[int]] | None:
+        """
+        Robust fallback: tokenize full chats (clean vs attack), then take the middle diff segment.
+
+        This handles cases where tokenizing `suffix_text` alone does not match the in-context tokenization
+        (BPE merges across the prompt/suffix boundary), and where `prepare_conversation()` fails with merges.
+        """
+        try:
+            from src.lm_utils.tokenization import tokenize_chats
+        except Exception:
+            return None
+
+        clean_with_target = self._attack_conversation_with_target(
+            clean_conversation=clean_conversation,
+            attack_conversation=clean_conversation,
+        )
+        attack_with_target = self._attack_conversation_with_target(
+            clean_conversation=clean_conversation,
+            attack_conversation=attack_conversation,
+        )
+
+        clean_ids = tokenize_chats([clean_with_target], self.tokenizer)[0].tolist()
+        attack_ids = tokenize_chats([attack_with_target], self.tokenizer)[0].tolist()
+        if not clean_ids or not attack_ids:
+            return None
+
+        lcp = self._lcp_len(clean_ids, attack_ids)
+        # Ensure suffix comparison doesn't overlap the prefix.
+        max_suf = min(len(clean_ids) - lcp, len(attack_ids) - lcp)
+        if max_suf < 0:
+            return None
+        lcsuf = self._lcsuf_len(clean_ids, attack_ids, max_len=max_suf)
+        mid_len = len(attack_ids) - lcp - lcsuf
+        if mid_len <= 0:
+            return None
+
+        mid_start = lcp
+        mid_ids = attack_ids[mid_start : mid_start + mid_len]
+
+        # For suffix attacks, we usually want the *tail* of the diff segment.
+        if suffix_tokens > 0 and len(mid_ids) > suffix_tokens:
+            mid_start = mid_start + (len(mid_ids) - suffix_tokens)
+            mid_ids = mid_ids[-suffix_tokens:]
+
+        return mid_start, len(mid_ids), mid_ids
 
     def compute_ppl(self, text: str, model_id: str) -> float:
         """
@@ -237,18 +384,26 @@ class SuffixMetricsComputer:
         """
         if not suffix_text.strip():
             return None
-        suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
-        if not suffix_ids:
-            return None
+        # Try a couple of tokenizations: suffixes often start with a leading space in the
+        # full chat template even if `suffix_text` itself doesn't.
+        candidates = [suffix_text]
+        if not suffix_text.startswith(" "):
+            candidates.append(" " + suffix_text)
 
-        # Find the last occurrence (suffix is usually near the end).
-        last = -1
-        for i in range(0, len(full_token_ids) - len(suffix_ids) + 1):
-            if full_token_ids[i : i + len(suffix_ids)] == suffix_ids:
-                last = i
-        if last == -1:
-            return None
-        return last, len(suffix_ids), suffix_ids
+        for cand in candidates:
+            suffix_ids = self.tokenizer.encode(cand, add_special_tokens=False)
+            if not suffix_ids:
+                continue
+
+            # Find the last occurrence (suffix is usually near the end).
+            last = -1
+            for i in range(0, len(full_token_ids) - len(suffix_ids) + 1):
+                if full_token_ids[i : i + len(suffix_ids)] == suffix_ids:
+                    last = i
+            if last != -1:
+                return last, len(suffix_ids), suffix_ids
+
+        return None
 
     def nn_decode_embeddings(
         self,
@@ -275,6 +430,9 @@ class SuffixMetricsComputer:
 
         # Decode on CPU to match cached vocab embeddings and avoid device mismatch errors.
         embeddings = embeddings.detach().cpu()
+
+        if suffix_len <= 0:
+            return "", []
 
         # Extract suffix embeddings
         suffix_embeds = embeddings[suffix_start:suffix_start + suffix_len].float()  # (actual_len, dim)
@@ -395,6 +553,7 @@ class SuffixMetricsComputer:
         config = run_data.get("config", {})
         runs = run_data.get("runs", [])
         attack_name = config.get("attack", "unknown")
+        attack_params = config.get("attack_params", {}) if isinstance(config.get("attack_params", {}), dict) else {}
 
         # Extract model_id from config
         # Priority: model_params.id (local path) > model (HuggingFace ID)
@@ -433,6 +592,20 @@ class SuffixMetricsComputer:
 
                 # Extract suffix
                 suffix_text = self.extract_suffix(model_input, original_prompt)
+                suffix_from_optim_init = False
+                if not suffix_text:
+                    # Fallback for attacks that historically logged attacked prompts as `original_prompt`:
+                    # try to recover the textual suffix from `optim_str_init` if present.
+                    try:
+                        attack_user_content = next((m.get("content", "") for m in reversed(model_input) if m.get("role") == "user"), "")
+                    except Exception:
+                        attack_user_content = ""
+                    optim_str_init = attack_params.get("optim_str_init")
+                    if isinstance(optim_str_init, str) and optim_str_init and attack_user_content:
+                        idx = attack_user_content.rfind(optim_str_init)
+                        if idx != -1:
+                            suffix_text = attack_user_content[idx:]
+                            suffix_from_optim_init = True
                 if not suffix_text:
                     continue
 
@@ -452,6 +625,33 @@ class SuffixMetricsComputer:
                     "suffix_ppl": [suffix_ppl],
                 }
 
+                # If the attack already saved decoded token ids, reuse them to avoid NN decode.
+                decode_scores = step.get("scores", {}).get("decode", {})
+                saved_token_ids = decode_scores.get("token_ids") if isinstance(decode_scores, dict) else None
+                decoded_ids: list[int] | None = None
+                if isinstance(saved_token_ids, list) and saved_token_ids:
+                    if all(isinstance(t, (int, float)) for t in saved_token_ids):
+                        decoded_ids = [int(t) for t in saved_token_ids]
+                    elif isinstance(saved_token_ids[0], list):
+                        decoded_ids = [int(t) for t in saved_token_ids[0]]
+                if decoded_ids is not None:
+                    decoded_text = self.tokenizer.decode(decoded_ids, skip_special_tokens=True)
+                    decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
+                    orig_suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
+                    match_metrics = self.compute_decode_match(
+                        suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                    )
+                    decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
+                    metrics["decode_text"] = [decoded_text]
+                    metrics["decode_text_raw"] = [decoded_text_raw]
+                    metrics["decode_token_ids"] = [decoded_ids]
+                    metrics["decode_ppl"] = [decoded_ppl]
+                    metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
+                    metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
+                    metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
+                    metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
+                    embeddings_path = None
+
                 # If embeddings available, do NN decode
                 if embeddings_path and os.path.exists(embeddings_path):
                     try:
@@ -465,44 +665,200 @@ class SuffixMetricsComputer:
                                 break
 
                         if embeddings is not None:
-                            # Determine suffix span in *embedding space*.
-                            # Prefer using logged `model_input_tokens` (full chat-template tokens).
+                            if embeddings.ndim != 2:
+                                metrics["decode_skipped"] = [1.0]
+                                metrics["decode_skip_reason"] = [f"embeddings_ndim={embeddings.ndim} shape={tuple(embeddings.shape)}"]
+                                embeddings = None
+
+                        # Random-restart logs suffix-only embeddings (N_suffix, D).
+                        if embeddings is not None and attack_name == "random_restart":
+                            emb_len = int(embeddings.size(0))
+                            # Heuristic: treat as suffix-only if it matches suffix token count.
+                            if emb_len > 0 and emb_len <= max(1, suffix_tokens + 2):
+                                decoded_text, decoded_ids = self.nn_decode_embeddings(embeddings, 0, emb_len)
+                                decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
+                                orig_suffix_ids = self.tokenizer.encode(suffix_text, add_special_tokens=False)
+                                match_metrics = self.compute_decode_match(
+                                    suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                                )
+                                decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
+                                metrics["decode_text"] = [decoded_text]
+                                metrics["decode_text_raw"] = [decoded_text_raw]
+                                metrics["decode_token_ids"] = [decoded_ids]
+                                metrics["decode_ppl"] = [decoded_ppl]
+                                metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
+                                metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
+                                metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
+                                metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
+                                embeddings = None
+
+                        if embeddings is not None:
+                            # Prefer computing suffix span via `prepare_conversation` (matches attack tokenization).
+                            clean_for_span = original_prompt
+                            if suffix_from_optim_init:
+                                # If original_prompt already contains the suffix, reconstruct a "clean" conversation
+                                # by trimming the suffix from the final user message. This enables suffix span
+                                # recovery even for legacy logs where clean/attack prompts are identical.
+                                try:
+                                    clean_guess = copy.deepcopy(original_prompt)
+                                    user_idx = next((i for i in range(len(clean_guess) - 1, -1, -1) if clean_guess[i].get("role") == "user"), None)
+                                    if user_idx is not None:
+                                        uc = str(clean_guess[user_idx].get("content", ""))
+                                        j = uc.rfind(suffix_text)
+                                        if j != -1 and j + len(suffix_text) == len(uc):
+                                            uc2 = uc[:j].rstrip()
+                                            clean_guess[user_idx]["content"] = uc2
+                                            clean_for_span = clean_guess
+                                except Exception:
+                                    clean_for_span = original_prompt
+
+                            span = self._suffix_span_via_prepare_conversation(
+                                clean_conversation=clean_for_span,
+                                attack_conversation=model_input,
+                            )
+                            if span is not None and span[1] == 0 and suffix_text.strip():
+                                # If `original_prompt` already contains the suffix (legacy logs), prepare_conversation
+                                # will see no diff and return an empty attack span. Fall back to token search.
+                                span = None
+
                             suffix_loc = None
-                            if isinstance(model_input_tokens, list) and all(isinstance(t, int) for t in model_input_tokens):
+                            if span is None and isinstance(model_input_tokens, list) and all(isinstance(t, int) for t in model_input_tokens):
                                 suffix_loc = self.locate_suffix_in_tokens(
                                     full_token_ids=model_input_tokens,
                                     suffix_text=suffix_text,
                                 )
-                            if suffix_loc is not None:
-                                suffix_start, suffix_len, orig_suffix_ids = suffix_loc
-                            else:
-                                # Fallback: token-level diff on user message only (can be misaligned with chat templates).
+                                if suffix_loc is not None:
+                                    suffix_start, suffix_len, orig_suffix_ids = suffix_loc
+                                    attack_prefix_len = 0
+                            elif span is None:
+                                # Fallback: if we have no logged token ids, reconstruct them via the repo tokenizer helper.
+                                try:
+                                    from src.lm_utils.tokenization import tokenize_chats
+
+                                    attack_with_target = self._attack_conversation_with_target(
+                                        clean_conversation=original_prompt,
+                                        attack_conversation=model_input,
+                                    )
+                                    full_ids = tokenize_chats([attack_with_target], self.tokenizer)[0].tolist()
+                                    suffix_loc = self.locate_suffix_in_tokens(
+                                        full_token_ids=full_ids,
+                                        suffix_text=suffix_text,
+                                    )
+                                    if suffix_loc is not None:
+                                        suffix_start, suffix_len, orig_suffix_ids = suffix_loc
+                                        attack_prefix_len = 0
+                                except Exception:
+                                    suffix_loc = None
+
+                            if span is not None:
+                                suffix_start, suffix_len, orig_suffix_ids, attack_prefix_len = span
+                            elif suffix_loc is None:
+                                # Last-resort: token-level diff on user message only (can be misaligned with chat templates).
                                 suffix_start, suffix_len, orig_suffix_ids = self.rebuild_attack_mask(
                                     model_input, original_prompt
                                 )
+                                attack_prefix_len = 0
 
-                            # If embeddings don't look like full-sequence embeddings, skip NN decode.
-                            if embeddings.ndim != 2 or embeddings.size(0) < (suffix_start + suffix_len):
+                            # If we still got an empty span (legacy logs: clean == attack, or token merges),
+                            # try a full-chat token diff (clean vs attack).
+                            if suffix_len <= 0:
+                                diff = self._suffix_span_via_token_diff(
+                                    clean_conversation=clean_for_span,
+                                    attack_conversation=model_input,
+                                    suffix_tokens=suffix_tokens,
+                                )
+                                if diff is not None:
+                                    suffix_start, suffix_len, orig_suffix_ids = diff
+                                    attack_prefix_len = 0
+                            if suffix_len <= 0:
                                 metrics["decode_skipped"] = [1.0]
-                                metrics["decode_skip_reason"] = [f"embeddings_shape={tuple(embeddings.shape)} suffix_span=({suffix_start},{suffix_len})"]
-                                # Do not treat this as an error: some attacks log non-sequence tensors (e.g. deltas).
+                                metrics["decode_skip_reason"] = [f"suffix_len={suffix_len} (cannot decode)"]
                                 embeddings = None
 
-                            if embeddings is not None:
-                                # NN decode
-                                decoded_text, decoded_ids = self.nn_decode_embeddings(
-                                    embeddings, suffix_start, suffix_len
-                                )
+                            # Handle attacks that log deltas (e.g. natural_suffix_embedding): embeddings are (N_attack, D)
+                            # and need to be added to the base token embeddings before NN decode.
+                            is_delta = attack_name in {"natural_suffix_embedding", "natural_suffix_embedding_attack"}
+                            if is_delta:
+                                # Reconstruct attack token ids via prepare_conversation.
+                                try:
+                                    from src.lm_utils.tokenization import TokenMergeError, prepare_conversation
+                                except Exception as e:
+                                    metrics["decode_skipped"] = [1.0]
+                                    metrics["decode_skip_reason"] = [f"delta_decode_import_error={e}"]
+                                    embeddings = None
+                                if embeddings is not None:
+                                    attack_with_target = self._attack_conversation_with_target(
+                                        clean_conversation=original_prompt,
+                                        attack_conversation=model_input,
+                                    )
+                                    try:
+                                        parts_per_turn = prepare_conversation(self.tokenizer, original_prompt, attack_with_target)
+                                    except TokenMergeError as e:
+                                        metrics["decode_skipped"] = [1.0]
+                                        metrics["decode_skip_reason"] = [f"delta_prepare_conversation_failed={e}"]
+                                        embeddings = None
+                                    if embeddings is not None and parts_per_turn:
+                                        pre_toks, attack_prefix_toks, _, attack_suffix_toks, _, _ = parts_per_turn[-1]
+                                        attack_prefix_ids = attack_prefix_toks.tolist()
+                                        attack_suffix_ids = attack_suffix_toks.tolist()
+                                        attack_ids = attack_prefix_ids + attack_suffix_ids
+                                        if embeddings.size(0) != len(attack_ids):
+                                            # Sometimes we only log suffix deltas (no prefix).
+                                            if embeddings.size(0) == len(attack_suffix_ids):
+                                                attack_prefix_ids = []
+                                                attack_ids = attack_suffix_ids
+                                            else:
+                                                metrics["decode_skipped"] = [1.0]
+                                                metrics["decode_skip_reason"] = [f"delta_len_mismatch embeddings_n={embeddings.size(0)} attack_n={len(attack_ids)} suffix_n={len(attack_suffix_ids)}"]
+                                                embeddings = None
 
-                                # Compute decode match
+                                        if embeddings is not None:
+                                            embed_layer = self.model.get_input_embeddings()
+                                            ids_t = torch.tensor(attack_ids, dtype=torch.long, device=self.model.device)
+                                            with torch.no_grad():
+                                                base = embed_layer(ids_t).detach().cpu().float()
+                                            delta = embeddings.detach().cpu().float()
+                                            perturbed = base + delta
+                                            suffix_start_in_attack = len(attack_prefix_ids)
+                                            suffix_len_in_attack = len(attack_suffix_ids) if attack_suffix_ids else len(orig_suffix_ids)
+                                            # Override orig suffix ids for match metrics (more reliable).
+                                            if attack_suffix_ids:
+                                                orig_suffix_ids = attack_suffix_ids
+                                            decoded_text, decoded_ids = self.nn_decode_embeddings(
+                                                perturbed, suffix_start_in_attack, suffix_len_in_attack
+                                            )
+                                            decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
+                                            match_metrics = self.compute_decode_match(
+                                                suffix_text, decoded_text, orig_suffix_ids, decoded_ids
+                                            )
+                                            decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
+                                            metrics["decode_text"] = [decoded_text]
+                                            metrics["decode_text_raw"] = [decoded_text_raw]
+                                            metrics["decode_token_ids"] = [decoded_ids]
+                                            metrics["decode_ppl"] = [decoded_ppl]
+                                            metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
+                                            metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]
+                                            metrics["decode_token_match_rate"] = [match_metrics["token_match_rate"]]
+                                            metrics["decode_edit_distance"] = [match_metrics["edit_distance"]]
+                                            embeddings = None  # Done
+
+                            # Non-delta path: decode from the full-sequence embeddings.
+                            if embeddings is not None:
+                                if embeddings.size(0) < (suffix_start + suffix_len):
+                                    metrics["decode_skipped"] = [1.0]
+                                    metrics["decode_skip_reason"] = [f"embeddings_shape={tuple(embeddings.shape)} suffix_span=({suffix_start},{suffix_len})"]
+                                    embeddings = None
+
+                            if embeddings is not None:
+                                decoded_text, decoded_ids = self.nn_decode_embeddings(embeddings, suffix_start, suffix_len)
+                                decoded_text_raw = self.tokenizer.decode(decoded_ids, skip_special_tokens=False)
                                 match_metrics = self.compute_decode_match(
                                     suffix_text, decoded_text, orig_suffix_ids, decoded_ids
                                 )
-
-                                # Compute PPL of decoded text (for comparison)
                                 decoded_ppl = self.compute_ppl(decoded_text, effective_model_id)
-
                                 metrics["decode_text"] = [decoded_text]
+                                metrics["decode_text_raw"] = [decoded_text_raw]
+                                metrics["decode_token_ids"] = [decoded_ids]
                                 metrics["decode_ppl"] = [decoded_ppl]
                                 metrics["decode_exact_text_match"] = [1.0 if match_metrics["exact_text_match"] else 0.0]
                                 metrics["decode_exact_token_match"] = [1.0 if match_metrics["exact_token_match"] else 0.0]

@@ -76,8 +76,8 @@ class PGDAttack(Attack):
         self._initialize_embedding_scale(model)
         original_model = self._maybe_load_original_model()
 
-        x, attack_masks, target_masks, conversations = self._prepare_dataset(dataset, tokenizer)
-        logging.info(f"Prepared {len(conversations)} conversations for attack")
+        x, attack_masks, target_masks, clean_conversations, attack_conversations = self._prepare_dataset(dataset, tokenizer)
+        logging.info(f"Prepared {len(attack_conversations)} conversations for attack")
 
         assert isinstance(tokenizer.pad_token_id, int), "pad_token_id must be an integer"
         attention_mask = (x != tokenizer.pad_token_id).long()
@@ -89,7 +89,8 @@ class PGDAttack(Attack):
             attack_fn,
             x,
             y,
-            conversations,
+            clean_conversations,
+            attack_conversations,
             attention_mask,
             attack_masks,
             target_masks,
@@ -141,11 +142,16 @@ class PGDAttack(Attack):
             ).eval()
         return None
 
-    def _prepare_dataset(self, dataset, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Conversation]]:
+    def _prepare_dataset(
+        self,
+        dataset,
+        tokenizer,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Conversation], List[Conversation]]:
         all_tokens = []
         all_attack_masks = []
         all_target_masks = []
-        all_conversations = []
+        all_clean_conversations = []
+        all_attack_conversations = []
 
         for conversation in dataset:
             try:
@@ -161,11 +167,12 @@ class PGDAttack(Attack):
             all_tokens.append(tokens)
             all_attack_masks.append(attack_mask)
             all_target_masks.append(target_mask)
-            all_conversations.append(attack_conversation)
+            all_clean_conversations.append(conversation)
+            all_attack_conversations.append(attack_conversation)
         all_tokens = pad_sequence(all_tokens, batch_first=True, padding_value=tokenizer.pad_token_id)
         all_target_masks = pad_sequence(all_target_masks, batch_first=True)
         all_attack_masks = pad_sequence(all_attack_masks, batch_first=True)
-        return all_tokens, all_attack_masks, all_target_masks, all_conversations
+        return all_tokens, all_attack_masks, all_target_masks, all_clean_conversations, all_attack_conversations
 
     def _prepare_single_conversation(self, conversation, tokenizer, optim_str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Conversation]:
         attack_conversation = [
@@ -198,7 +205,8 @@ class PGDAttack(Attack):
         original_model: Optional[PreTrainedModel],
         x_batch: torch.Tensor,
         y_batch: torch.Tensor,
-        original_conversations_batch: List[Conversation],
+        clean_conversations_batch: List[Conversation],
+        attack_conversations_batch: List[Conversation],
         attention_mask_batch: torch.Tensor,
         attack_masks_batch: torch.Tensor,
         target_masks_batch: torch.Tensor
@@ -221,6 +229,34 @@ class PGDAttack(Attack):
             attention_mask_batch = attention_mask_batch.to(device)
             attack_masks_batch = attack_masks_batch.to(device).bool()
             target_masks_batch = target_masks_batch.to(device).bool()
+            attack_masks_cpu = attack_masks_batch.detach().cpu()
+
+            decode_vocab_norm = None
+            if self.config.log_embeddings:
+                embed_layer = model.get_input_embeddings()
+                vocab = embed_layer.weight.detach()
+                if hasattr(embed_layer, "embed_scale"):
+                    vocab = vocab * embed_layer.embed_scale.to(vocab)
+                vocab = vocab.float().cpu()
+                decode_vocab_norm = vocab / (vocab.norm(dim=-1, keepdim=True) + 1e-8)
+
+            def _nn_decode_attack_tokens(attack_embeds: torch.Tensor) -> list[int]:
+                if decode_vocab_norm is None or attack_embeds.numel() == 0:
+                    return []
+                attack_embeds = attack_embeds.detach().cpu().float()
+                attack_norm = attack_embeds / (attack_embeds.norm(dim=-1, keepdim=True) + 1e-8)
+                chunk_size = 4096
+                best_sim = torch.full((attack_norm.size(0),), -float("inf"), dtype=torch.float32)
+                best_id = torch.zeros((attack_norm.size(0),), dtype=torch.long)
+                for start in range(0, decode_vocab_norm.size(0), chunk_size):
+                    end = min(start + chunk_size, decode_vocab_norm.size(0))
+                    chunk = decode_vocab_norm[start:end]
+                    sims = attack_norm @ chunk.t()
+                    chunk_best_sim, chunk_best_idx = sims.max(dim=-1)
+                    improved = chunk_best_sim > best_sim
+                    best_sim[improved] = chunk_best_sim[improved]
+                    best_id[improved] = chunk_best_idx[improved] + start
+                return best_id.tolist()
 
             original_embeddings = model.get_input_embeddings()(x_batch)
             if self.config.attack_space == "one-hot":
@@ -375,6 +411,9 @@ class PGDAttack(Attack):
             t_end = time.time()
             runs = []
             for i in range(B):
+                # Log the full token ids that correspond to the (possibly padded) embedding sequence we store.
+                # This makes downstream suffix span recovery reliable.
+                full_input_token_ids: list[int] = x_batch[i].detach().cpu().tolist()
                 steps: list[AttackStepResult] = []
                 if gen_mode == "all":
                     # outputs are ordered by (i, step) insertion above
@@ -383,49 +422,81 @@ class PGDAttack(Attack):
                     for step in range(self.config.num_steps):
                         # Get embeddings for this step if logging is enabled
                         step_embeds = batch_full_embeds_per_step[i][step] if self.config.log_embeddings else None
+                        decode_scores = {}
+                        if step_embeds is not None and decode_vocab_norm is not None:
+                            attack_pos = attack_masks_cpu[i].nonzero(as_tuple=True)[0]
+                            attack_embeds = step_embeds[attack_pos] if attack_pos.numel() > 0 else None
+                            if attack_embeds is not None:
+                                decoded_ids = _nn_decode_attack_tokens(attack_embeds)
+                                decode_scores = {
+                                    "token_ids": [float(t) for t in decoded_ids],
+                                }
                         steps.append(
                             AttackStepResult(
                                 step=step,
                                 model_completions=outputs[base + step],
+                                scores={"decode": decode_scores} if decode_scores else {},
                                 time_taken=batch_times[i][step],
                                 loss=batch_losses[i][step],
                                 model_input_embeddings=step_embeds,
-                                model_input=original_conversations_batch[i],
+                                model_input=attack_conversations_batch[i],
+                                model_input_tokens=full_input_token_ids,
                             )
                         )
                 elif gen_mode == "last":
                     # Get last step embeddings if logging is enabled
                     last_embeds = batch_full_embeds_per_step[i][-1] if self.config.log_embeddings else None
+                    decode_scores = {}
+                    if last_embeds is not None and decode_vocab_norm is not None:
+                        attack_pos = attack_masks_cpu[i].nonzero(as_tuple=True)[0]
+                        attack_embeds = last_embeds[attack_pos] if attack_pos.numel() > 0 else None
+                        if attack_embeds is not None:
+                            decoded_ids = _nn_decode_attack_tokens(attack_embeds)
+                            decode_scores = {
+                                "token_ids": [float(t) for t in decoded_ids],
+                            }
                     steps.append(
                         AttackStepResult(
                             step=self.config.num_steps - 1,
                             model_completions=outputs[i],
+                            scores={"decode": decode_scores} if decode_scores else {},
                             time_taken=batch_times[i][-1] if batch_times[i] else 0.0,
                             loss=batch_losses[i][-1] if batch_losses[i] else None,
                             model_input_embeddings=last_embeds,
-                            model_input=original_conversations_batch[i],
+                            model_input=attack_conversations_batch[i],
+                            model_input_tokens=full_input_token_ids,
                         )
                     )
                 elif gen_mode == "best":
                     # Get best step embeddings if logging is enabled
                     best_embeds = best_full_embeds[i] if self.config.log_embeddings else None
+                    decode_scores = {}
+                    if best_embeds is not None and decode_vocab_norm is not None:
+                        attack_pos = attack_masks_cpu[i].nonzero(as_tuple=True)[0]
+                        attack_embeds = best_embeds[attack_pos] if attack_pos.numel() > 0 else None
+                        if attack_embeds is not None:
+                            decoded_ids = _nn_decode_attack_tokens(attack_embeds)
+                            decode_scores = {
+                                "token_ids": [float(t) for t in decoded_ids],
+                            }
                     steps.append(
                         AttackStepResult(
                             step=best_step[i],
                             model_completions=outputs[i],
+                            scores={"decode": decode_scores} if decode_scores else {},
                             time_taken=batch_times[i][best_step[i]] if batch_times[i] else 0.0,
                             loss=batch_losses[i][best_step[i]] if batch_losses[i] else None,
                             model_input_embeddings=best_embeds,
-                            model_input=original_conversations_batch[i],
+                            model_input=attack_conversations_batch[i],
+                            model_input_tokens=full_input_token_ids,
                         )
                     )
                 else:
                     raise ValueError(f"Unknown generate_completions mode: {gen_mode}")
 
-                input_conversation = original_conversations_batch[i]
                 runs.append(
                     SingleAttackRunResult(
-                        original_prompt=input_conversation,
+                        original_prompt=clean_conversations_batch[i],
                         steps=steps,
                         total_time=(t_end - t_start) / B,
                     )

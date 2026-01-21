@@ -16,8 +16,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
-DATASET="${DATASET:-adv_behaviors}"
-IDX_EXPR="${IDX_EXPR:-\"list(range(50))\"}"
+DATASET="${DATASET:-strong_reject，adv_behaviors}"
 
 run_attack() {
   local attack_name="$1"

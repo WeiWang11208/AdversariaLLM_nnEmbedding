@@ -32,7 +32,7 @@
 ```bash
 # 基础用法：自动从 run.json 读取目标模型
 python scripts/compute_suffix_metrics.py \
-    --results_dir /mnt/public/share/users/wangwei/202512/AdversariaLLM-main/outputs/Qwen3_8b/natural_suffix_embedding/2026-01-12/23-51-00/ \
+    --results_dir /mnt/public/share/users/wangwei/202512/AdversariaLLM-main/outputs/natural_suffix_embedding/adv_behaviors/2026-01-20/13-54-35 \
     --recursive
 
 # 处理单个文件

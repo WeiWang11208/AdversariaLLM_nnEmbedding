@@ -1,4 +1,4 @@
-# Natural Suffix Embedding Attack（Idea 2.5）论文实验设计草案
+# Natural Suffix Embedding Attack（Idea 1）论文实验设计草案
 
 目标：把 `ideas/01_natural_suffix_embedding_attack.md` 的想法扩展成可投稿/可复现的一套实验与叙事：**优势是什么、意义是什么、贡献是什么、怎么对比、怎么消融、怎么展示核心特点**。
 

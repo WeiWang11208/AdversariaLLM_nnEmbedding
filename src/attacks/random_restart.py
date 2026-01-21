@@ -29,7 +29,7 @@ from .attack import (
     SingleAttackRunResult,
 )
 from ..dataset import PromptDataset
-from ..lm_utils import generate_ragged_batched, prepare_conversation
+from ..lm_utils import TokenMergeError, generate_ragged_batched, prepare_conversation, tokenize_chats
 from ..types import Conversation
 
 
@@ -108,6 +108,11 @@ class RandomRestartAttack(Attack):
     ) -> SingleAttackRunResult:
         """Run the attack on a single conversation."""
         t0 = time.time()
+        # Freeze model weights to reduce VRAM usage; we only need grads for embeddings_adv.
+        model_params = list(model.parameters())
+        model_requires_grad = [p.requires_grad for p in model_params]
+        for p in model_params:
+            p.requires_grad_(False)
 
         # Prepare tokens
         embed_weights = self._get_embedding_matrix(model)
@@ -136,13 +141,14 @@ class RandomRestartAttack(Attack):
         embeddings_user = embed_weights[user_prompt_ids[0]]
         embeddings_adv = embed_weights[adv_string_init_ids[0]]
         embeddings_target = embed_weights[target_ids[0]]
+        embeddings_user_cpu = embeddings_user.detach().cpu().to(dtype=model.dtype)
 
         # Add initialization noise
         embeddings_adv = embeddings_adv + torch.normal(
             0, self.config.init_noise_std, embeddings_adv.size()
         ).to(model.device)
-
-        embeddings_adv.requires_grad = True
+        # Ensure we optimize a leaf tensor. The noise addition makes it non-leaf.
+        embeddings_adv = embeddings_adv.detach().clone().requires_grad_(True)
 
         # Setup optimizer
         optimizer = optim.AdamW(
@@ -161,13 +167,18 @@ class RandomRestartAttack(Attack):
         best_discrete_losses = [float("inf")] * len(self.config.checkpoints)
         best_strings = [""] * len(self.config.checkpoints)
         distances = [float("inf")] * len(self.config.checkpoints)
+        best_token_ids: list[list[int] | None] = [None] * len(self.config.checkpoints)
+        checkpoint_steps: list[int | None] = [None] * len(self.config.checkpoints)
         # Store continuous embeddings at each checkpoint for realizability analysis
         checkpoint_embeddings: list[torch.Tensor | None] = [None] * len(self.config.checkpoints)
 
         all_losses = []
         all_suffixes = []
+        per_step_records: list[dict] = []
+        per_step_adv_embeddings: list[torch.Tensor] = []
 
         # Optimization loop
+        last_token_ids: list[int] | None = None
         for iteration in range(self.config.num_steps):
             optimizer.zero_grad()
 
@@ -194,7 +205,9 @@ class RandomRestartAttack(Attack):
                     )
                 )
 
-                current_suffix = tokenizer.decode(closest_indices[0])
+                current_token_ids = closest_indices[0].detach().cpu().tolist()
+                last_token_ids = current_token_ids
+                current_suffix = tokenizer.decode(current_token_ids, skip_special_tokens=True)
                 current_mean_distance = closest_distances.mean().cpu().item()
 
                 # Calculate discrete loss
@@ -209,6 +222,16 @@ class RandomRestartAttack(Attack):
 
             all_losses.append(discrete_loss_value)
             all_suffixes.append(current_suffix)
+            per_step_records.append({
+                "loss": float(loss_value),
+                "discrete_loss": float(discrete_loss_value),
+                "distance": float(current_mean_distance),
+                "token_ids": current_token_ids,
+                "suffix": current_suffix,
+            })
+            per_step_adv_embeddings.append(
+                embeddings_adv.detach().cpu().to(dtype=model.dtype).clone()
+            )
 
             # Save checkpoints when loss crosses thresholds
             for i, checkpoint in enumerate(self.config.checkpoints):
@@ -216,28 +239,19 @@ class RandomRestartAttack(Attack):
                     best_discrete_losses[i] = discrete_loss_value
                     best_strings[i] = current_suffix
                     distances[i] = current_mean_distance
-                    # Save continuous embeddings for realizability analysis
+                    best_token_ids[i] = current_token_ids
+                    checkpoint_steps[i] = iteration
+                    # Save continuous suffix embeddings for realizability analysis
                     if self.config.log_embeddings:
-                        # Concatenate full input: user + adv + target embeddings
-                        full_embeds = torch.cat([
-                            embeddings_user,
-                            embeddings_adv.detach(),
-                            embeddings_target
-                        ], dim=0).cpu()
-                        checkpoint_embeddings[i] = full_embeds
+                        checkpoint_embeddings[i] = embeddings_adv.detach().cpu().clone()
                     self.logger.info(
                         f"Checkpoint {i}: loss={loss_value:.4f}, "
                         f"discrete_loss={discrete_loss_value:.4f}, "
                         f"suffix={current_suffix[:50]}"
                     )
-                    # Early stop if all checkpoints are filled
+                    # Keep iterating even if all checkpoints are filled.
                     if best_discrete_losses[-1] != float("inf"):
-                        self.logger.info("All checkpoints reached. Stopping early.")
-                        break
-
-            # Check if we should stop early
-            if best_discrete_losses[-1] != float("inf"):
-                break
+                        self.logger.info("All checkpoints reached. Continuing to finish iterations.")
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(
@@ -262,33 +276,73 @@ class RandomRestartAttack(Attack):
         last_discrete_loss = all_losses[-1] if all_losses else float("inf")
         last_suffix = all_suffixes[-1] if all_suffixes else ""
         last_distance = distances[-1] if any(d != float("inf") for d in distances) else 0.0
+        last_step_idx = len(per_step_records) - 1 if per_step_records else 0
 
         for i in range(len(self.config.checkpoints)):
             if best_discrete_losses[i] == float("inf"):
                 best_discrete_losses[i] = last_discrete_loss
                 best_strings[i] = last_suffix
                 distances[i] = last_distance
+                if best_token_ids[i] is None:
+                    best_token_ids[i] = last_token_ids
+                if checkpoint_steps[i] is None:
+                    checkpoint_steps[i] = last_step_idx
                 # Also save last embedding if logging is enabled and not yet saved
                 if self.config.log_embeddings and checkpoint_embeddings[i] is None:
-                    full_embeds = torch.cat([
-                        embeddings_user,
-                        embeddings_adv.detach(),
-                        embeddings_target
-                    ], dim=0).cpu()
-                    checkpoint_embeddings[i] = full_embeds
+                    checkpoint_embeddings[i] = embeddings_adv.detach().cpu().clone()
 
-        # Generate completions for best suffixes
-        steps = self._generate_completions(
+        # Generate completions for every step using continuous embeddings.
+        all_suffixes = [rec["suffix"] for rec in per_step_records]
+        embedding_list = [
+            torch.cat([embeddings_user_cpu, adv], dim=0)
+            for adv in per_step_adv_embeddings
+        ]
+        batch_completions, token_list, attack_conversations = self._generate_completions(
             model,
             tokenizer,
             conversation,
-            best_strings,
-            best_discrete_losses,
-            distances,
-            checkpoint_embeddings if self.config.log_embeddings else None,
+            all_suffixes,
+            embedding_list,
         )
 
+        # Build per-step results (loss logged for every step, completions for checkpoints only)
+        steps: list[AttackStepResult] = []
+        for step_idx, rec in enumerate(per_step_records):
+            decode_scores = {}
+            if rec.get("token_ids") is not None:
+                decode_scores = {"token_ids": [float(t) for t in rec["token_ids"]]}
+            scores = {
+                "optimization": {
+                    "discrete_loss": [rec["discrete_loss"]],
+                    "distance": [rec["distance"]],
+                }
+            }
+            if decode_scores:
+                scores["decode"] = decode_scores
+            steps.append(
+                AttackStepResult(
+                    step=step_idx,
+                    model_completions=batch_completions[step_idx],
+                    time_taken=0.0,
+                    loss=rec["loss"],
+                    flops=0,
+                    scores=scores,
+                    model_input=attack_conversations[step_idx],
+                    model_input_tokens=token_list[step_idx].tolist(),
+                )
+            )
+
+        # Attach completions/model_input to the checkpoint steps.
+        for ckpt_idx, step_idx in enumerate(checkpoint_steps):
+            if step_idx is None or step_idx < 0 or step_idx >= len(steps):
+                continue
+            if self.config.log_embeddings:
+                steps[step_idx].model_input_embeddings = per_step_adv_embeddings[step_idx]
+
         t1 = time.time()
+        # Restore original requires_grad flags for safety.
+        for p, req in zip(model_params, model_requires_grad):
+            p.requires_grad_(req)
         return SingleAttackRunResult(
             original_prompt=conversation,
             steps=steps,
@@ -301,12 +355,9 @@ class RandomRestartAttack(Attack):
         tokenizer,
         conversation,
         suffixes,
-        losses,
-        distances,
-        embeddings=None,
+        embedding_list,
     ):
         """Generate completions for all checkpoint suffixes."""
-        steps = []
         attack_conversations = []
         token_list = []
 
@@ -318,14 +369,18 @@ class RandomRestartAttack(Attack):
             attack_conversations.append(attack_conv)
 
             # Prepare tokens
-            tokens = prepare_conversation(tokenizer, conversation, attack_conv)[0]
-            token_list.append(torch.cat(tokens[:5]))
+            try:
+                tokens = prepare_conversation(tokenizer, conversation, attack_conv)[0]
+                token_list.append(torch.cat(tokens[:5]))
+            except TokenMergeError:
+                # Fall back to full chat tokenization when merges prevent splitting.
+                token_list.append(tokenize_chats([attack_conv], tokenizer)[0])
 
-        # Generate completions in batch
+        # Generate completions in batch using continuous embeddings
         batch_completions = generate_ragged_batched(
             model,
             tokenizer,
-            token_list=token_list,
+            embedding_list=embedding_list,
             max_new_tokens=self.config.generation_config.max_new_tokens,
             temperature=self.config.generation_config.temperature,
             top_p=self.config.generation_config.top_p,
@@ -334,23 +389,7 @@ class RandomRestartAttack(Attack):
             initial_batch_size=len(token_list),
         )
 
-        # Create step results
-        for i, (suffix, loss, distance) in enumerate(zip(suffixes, losses, distances)):
-            # Get embedding for this checkpoint if available
-            step_embedding = embeddings[i] if embeddings is not None else None
-            step = AttackStepResult(
-                step=i,
-                model_completions=batch_completions[i],
-                time_taken=0.0,  # Time is tracked per conversation
-                loss=loss,
-                flops=0,
-                model_input=attack_conversations[i],
-                model_input_tokens=token_list[i].tolist(),
-                model_input_embeddings=step_embedding,
-            )
-            steps.append(step)
-
-        return steps
+        return batch_completions, token_list, attack_conversations
 
     def _get_embedding_matrix(self, model):
         """Get embedding matrix from model."""
@@ -407,6 +446,9 @@ class RandomRestartAttack(Attack):
         def normalize(v):
             return v / (torch.norm(v, p=2, dim=-1, keepdim=True) + 1e-8)
 
+        # Ensure dtype consistency to avoid cdist errors.
+        if embeddings_adv.dtype != embed_weights.dtype:
+            embeddings_adv = embeddings_adv.to(embed_weights.dtype)
         embeddings_adv_norm = normalize(embeddings_adv)
         embed_weights_norm = normalize(embed_weights)
 
